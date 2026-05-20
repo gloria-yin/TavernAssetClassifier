@@ -1,4 +1,4 @@
-import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { getContext } from '../../../../scripts/extensions.js';
 import { background_settings, getBackgroundPath } from '../../../../scripts/backgrounds.js';
 import { getThemeObject, power_user } from '../../../../scripts/power-user.js';
@@ -33,6 +33,9 @@ const state = {
   refreshTimer: null,
   allThemeOptions: [],
   suppressThemeObserver: false,
+  themeBackgroundSyncTimer: null,
+  themeBackgroundSyncBound: false,
+  lastThemeBackgroundSyncName: '',
   presetEntryObserver: null,
   presetEntryBodyObserver: null,
   presetEntryTimer: null,
@@ -262,7 +265,6 @@ function applyBackgroundFile(filename) {
   document.querySelector('#bg1')?.style.setProperty('background-image', url);
   background_settings.name = normalized;
   background_settings.url = url;
-  saveSettingsDebounced();
   return true;
 }
 
@@ -271,7 +273,36 @@ function applyBoundBackgroundForTheme(themeName = getCurrentThemeName()) {
   const record = getThemeRecordForTheme(themeName);
   const background = normalizeTag(record?.background);
   if (!background) return false;
+  state.lastThemeBackgroundSyncName = themeName;
   return applyBackgroundFile(background);
+}
+
+function syncBoundBackgroundForCurrentTheme(force = false) {
+  if (!isBeautifyFeatureEnabled()) return;
+  const themeName = normalizeTag(power_user.theme) || getCurrentThemeName();
+  if (!themeName) return;
+  if (!force && state.lastThemeBackgroundSyncName === themeName) return;
+  const applied = applyBoundBackgroundForTheme(themeName);
+  if (!applied) state.lastThemeBackgroundSyncName = themeName;
+}
+
+function startThemeBackgroundSync() {
+  if (state.themeBackgroundSyncBound) return;
+  state.themeBackgroundSyncBound = true;
+  eventSource?.on?.(event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
+  state.themeBackgroundSyncTimer = setInterval(() => syncBoundBackgroundForCurrentTheme(), 3000);
+}
+
+function stopThemeBackgroundSync() {
+  if (state.themeBackgroundSyncTimer) {
+    clearInterval(state.themeBackgroundSyncTimer);
+    state.themeBackgroundSyncTimer = null;
+  }
+  if (state.themeBackgroundSyncBound) {
+    eventSource?.removeListener?.(event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
+    state.themeBackgroundSyncBound = false;
+  }
+  state.lastThemeBackgroundSyncName = '';
 }
 
 function makeTag(category, tag, active = false, options = {}) {
@@ -1689,7 +1720,7 @@ function mountUi() {
 
   getThemeSelect()?.addEventListener('change', () => {
     scheduleRefresh();
-    setTimeout(() => applyBoundBackgroundForTheme(), 0);
+    setTimeout(() => syncBoundBackgroundForCurrentTheme(true), 0);
   });
 
   document.querySelector('#ui-preset-delete-button')?.addEventListener('click', () => {
@@ -1714,7 +1745,8 @@ function mountUi() {
   });
 
   scheduleRefresh();
-  applyBoundBackgroundForTheme();
+  startThemeBackgroundSync();
+  syncBoundBackgroundForCurrentTheme(true);
   return true;
 }
 
@@ -1725,6 +1757,7 @@ function destroyBeautifyFeature() {
   }
   state.observer?.disconnect();
   state.observer = null;
+  stopThemeBackgroundSync();
   restoreThemeSelectOptions();
   const themeBlock = document.querySelector('#UI-presets-block');
   const actions = document.querySelector('#tac-theme-actions');
