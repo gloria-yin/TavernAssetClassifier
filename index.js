@@ -267,10 +267,11 @@ function applyBackgroundFile(filename) {
 }
 
 function applyBoundBackgroundForTheme(themeName = getCurrentThemeName()) {
-  if (!isBeautifyFeatureEnabled()) return;
+  if (!isBeautifyFeatureEnabled()) return false;
   const record = getThemeRecordForTheme(themeName);
-  if (!record?.background) return;
-  applyBackgroundFile(record.background);
+  const background = normalizeTag(record?.background);
+  if (!background) return false;
+  return applyBackgroundFile(background);
 }
 
 function makeTag(category, tag, active = false, options = {}) {
