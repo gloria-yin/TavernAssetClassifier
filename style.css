@@ -776,7 +776,11 @@ li[data-pm-identifier].tac-preset-select-start {
 
   #tac-rename-modal,
   #tac-auto-modal {
-    place-items: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    place-items: initial;
+    padding: 0;
   }
 
   .tac-modal-card {
@@ -793,7 +797,8 @@ li[data-pm-identifier].tac-preset-select-start {
   #tac-auto-modal .tac-modal-card {
     height: auto;
     width: min(420px, calc(100vw - 24px));
-    max-height: calc(100dvh - max(16px, env(safe-area-inset-top)) - max(16px, env(safe-area-inset-bottom)));
+    max-height: calc(100dvh - 24px);
+    margin: 12px;
     border-radius: 10px;
   }
 
