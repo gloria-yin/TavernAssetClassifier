@@ -1,6 +1,7 @@
 import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { getContext } from '../../../../scripts/extensions.js';
 import { background_settings, getBackgroundPath } from '../../../../scripts/backgrounds.js';
+import { promptManager } from '../../../../scripts/openai.js';
 import { getThemeObject, power_user } from '../../../../scripts/power-user.js';
 
 const EXTENSION_KEY = 'tavernAssetClassifier';
@@ -1607,6 +1608,44 @@ function handlePresetEntryListClick(event) {
   createPresetEntryGroup(item);
 }
 
+function getPromptItemDisabledClass(item) {
+  const promptClass = Array.from(item?.classList || []).find(className => className.endsWith('prompt_manager_prompt'));
+  if (!promptClass) return '';
+  return `${promptClass.replace(/prompt_manager_prompt$/, '')}prompt_manager_prompt_disabled`;
+}
+
+function setPromptItemEnabledUi(item, enabled) {
+  const disabledClass = getPromptItemDisabledClass(item);
+  if (disabledClass) item.classList.toggle(disabledClass, !enabled);
+  const toggle = item.querySelector('.prompt-manager-toggle-action');
+  toggle?.classList.toggle('fa-toggle-on', enabled);
+  toggle?.classList.toggle('fa-toggle-off', !enabled);
+}
+
+function handlePresetEntryToggleClick(event) {
+  const toggle = event.target.closest?.('.prompt-manager-toggle-action');
+  if (!toggle) return;
+  const item = toggle.closest('li[data-pm-identifier]');
+  const identifier = getPromptIdentifier(item);
+  const manager = promptManager;
+  if (!item || !identifier || !manager?.getPromptOrderEntry || !manager?.tokenHandler?.getCounts || !manager?.saveServiceSettings) return;
+  const list = getPromptList();
+  if (manager.configuration?.listIdentifier && list?.id !== manager.configuration.listIdentifier) return;
+
+  const promptOrderEntry = manager.getPromptOrderEntry(manager.activeCharacter, identifier);
+  if (!promptOrderEntry) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation?.();
+
+  const counts = manager.tokenHandler.getCounts();
+  if (counts && typeof counts === 'object') counts[identifier] = null;
+  promptOrderEntry.enabled = !promptOrderEntry.enabled;
+  setPromptItemEnabledUi(item, promptOrderEntry.enabled);
+  manager.saveServiceSettings();
+}
+
 function nodeContainsPromptList(node) {
   if (!(node instanceof Element)) return false;
   const id = node.id || '';
@@ -1674,6 +1713,7 @@ function startPresetEntryGrouping() {
     if (!list.dataset.tacPresetGroupingBound) {
       list.dataset.tacPresetGroupingBound = '1';
       list.addEventListener('click', handlePresetEntryListClick, true);
+      list.addEventListener('click', handlePresetEntryToggleClick, true);
     }
     bindPresetEntrySortEvents(list);
     if (!state.presetEntryObserver) {
@@ -1731,6 +1771,8 @@ function destroyPresetEntryGrouping() {
   if (list) {
     delete list.dataset.tacPresetGroupingBound;
     delete list.dataset.tacPresetSortBound;
+    list.removeEventListener('click', handlePresetEntryListClick, true);
+    list.removeEventListener('click', handlePresetEntryToggleClick, true);
     const jquery = window.jQuery || window.$;
     jquery?.(list).off?.('.tac-preset-grouping');
   }
