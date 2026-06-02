@@ -40,6 +40,7 @@ const state = {
   presetEntryBodyObserver: null,
   presetEntryTimer: null,
   presetEntryButtonTimer: null,
+  presetEntryFrame: null,
   presetEntrySelection: null,
   presetEntryDragPoint: null,
   presetEntryPointerBound: false,
@@ -1372,14 +1373,28 @@ function syncPresetEntryGroupsFromDom() {
   if (changed) saveSettings();
 }
 
-function schedulePresetEntryRender(delay = 120) {
+function renderPresetEntryGroupsNow({ syncFromDom = false } = {}) {
+  if (!isPresetFeatureEnabled()) return;
+  if (syncFromDom) syncPresetEntryGroupsFromDom();
+  applyPresetEntryGroups();
+}
+
+function schedulePresetEntryRender(delay = 120, options = {}) {
   if (!isPresetFeatureEnabled()) return;
   clearTimeout(state.presetEntryTimer);
   state.presetEntryTimer = setTimeout(() => {
     if (!isPresetFeatureEnabled()) return;
-    syncPresetEntryGroupsFromDom();
-    applyPresetEntryGroups();
+    renderPresetEntryGroupsNow(options);
   }, delay);
+}
+
+function schedulePresetEntryFrameRender(options = {}) {
+  if (!isPresetFeatureEnabled() || state.presetEntryFrame) return;
+  const scheduleFrame = window.requestAnimationFrame || (callback => setTimeout(callback, 0));
+  state.presetEntryFrame = scheduleFrame(() => {
+    state.presetEntryFrame = null;
+    renderPresetEntryGroupsNow(options);
+  });
 }
 
 function getPresetEntryPointer(event) {
@@ -1604,9 +1619,9 @@ function nodeContainsPromptItem(node) {
   return Boolean(node.matches?.('li[data-pm-identifier]') || node.querySelector?.('li[data-pm-identifier]'));
 }
 
-function nodeIsPresetEntryControl(node) {
+function nodeIsPresetEntryDecoration(node) {
   if (!(node instanceof Element)) return false;
-  return Boolean(node.matches?.('.tac-preset-classify-button'));
+  return Boolean(node.matches?.('.tac-preset-classify-button, .tac-preset-group-header, .tac-preset-group-end'));
 }
 
 function shouldRenderPresetEntryMutations(mutations, list) {
@@ -1616,10 +1631,25 @@ function shouldRenderPresetEntryMutations(mutations, list) {
     if (!changedNodes.length) return false;
 
     if (mutation.target === list) {
-      return changedNodes.some(node => !nodeIsPresetEntryControl(node));
+      return changedNodes.some(node => !nodeIsPresetEntryDecoration(node));
     }
 
     return changedNodes.some(nodeContainsPromptItem);
+  });
+}
+
+function shouldInjectPresetEntryButtons(mutations) {
+  return mutations.some(mutation => {
+    if (mutation.type !== 'childList') return false;
+    return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
+      if (nodeIsPresetEntryDecoration(node)) return false;
+      if (!(node instanceof Element)) return false;
+      return Boolean(
+        node.matches?.('.prompt_manager_prompt_controls')
+          || node.querySelector?.('.prompt_manager_prompt_controls')
+          || node.closest?.('li[data-pm-identifier]'),
+      );
+    });
   });
 }
 
@@ -1648,10 +1678,11 @@ function startPresetEntryGrouping() {
     bindPresetEntrySortEvents(list);
     if (!state.presetEntryObserver) {
       state.presetEntryObserver = new MutationObserver(mutations => {
-        if (state.applyingPresetEntryGroups) return;
         if (shouldRenderPresetEntryMutations(mutations, list)) {
-          schedulePresetEntryRender();
-        } else {
+          clearTimeout(state.presetEntryTimer);
+          state.presetEntryTimer = null;
+          schedulePresetEntryFrameRender();
+        } else if (shouldInjectPresetEntryButtons(mutations)) {
           schedulePresetEntryButtonInjection();
         }
       });
@@ -1665,7 +1696,8 @@ function startPresetEntryGrouping() {
       if (!mutations.some(mutation => [...mutation.addedNodes, ...mutation.removedNodes].some(nodeContainsPromptList))) return;
       state.presetEntryObserver?.disconnect();
       state.presetEntryObserver = null;
-      setTimeout(tryStart, 80);
+      tryStart();
+      if (!getPromptList()) setTimeout(tryStart, 0);
     });
     state.presetEntryBodyObserver.observe(document.body, { childList: true, subtree: true });
   }
@@ -1681,6 +1713,11 @@ function destroyPresetEntryGrouping() {
   if (state.presetEntryButtonTimer) {
     clearTimeout(state.presetEntryButtonTimer);
     state.presetEntryButtonTimer = null;
+  }
+  if (state.presetEntryFrame) {
+    const cancelFrame = window.cancelAnimationFrame || clearTimeout;
+    cancelFrame(state.presetEntryFrame);
+    state.presetEntryFrame = null;
   }
   state.presetEntryObserver?.disconnect();
   state.presetEntryObserver = null;
