@@ -39,6 +39,7 @@ const state = {
   presetEntryObserver: null,
   presetEntryBodyObserver: null,
   presetEntryTimer: null,
+  presetEntryButtonTimer: null,
   presetEntrySelection: null,
   presetEntryDragPoint: null,
   presetEntryPointerBound: false,
@@ -1598,6 +1599,40 @@ function nodeContainsPromptList(node) {
   return Boolean(node.querySelector?.('#completion_prompt_manager_list, #openai_prompt_manager_list, [id$="prompt_manager_list"], ul[id*="prompt_manager"]'));
 }
 
+function nodeContainsPromptItem(node) {
+  if (!(node instanceof Element)) return false;
+  return Boolean(node.matches?.('li[data-pm-identifier]') || node.querySelector?.('li[data-pm-identifier]'));
+}
+
+function nodeIsPresetEntryControl(node) {
+  if (!(node instanceof Element)) return false;
+  return Boolean(node.matches?.('.tac-preset-classify-button'));
+}
+
+function shouldRenderPresetEntryMutations(mutations, list) {
+  return mutations.some(mutation => {
+    if (mutation.type !== 'childList') return false;
+    const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+    if (!changedNodes.length) return false;
+
+    if (mutation.target === list) {
+      return changedNodes.some(node => !nodeIsPresetEntryControl(node));
+    }
+
+    return changedNodes.some(nodeContainsPromptItem);
+  });
+}
+
+function schedulePresetEntryButtonInjection(delay = 80) {
+  if (!isPresetFeatureEnabled()) return;
+  clearTimeout(state.presetEntryButtonTimer);
+  state.presetEntryButtonTimer = setTimeout(() => {
+    state.presetEntryButtonTimer = null;
+    if (!isPresetFeatureEnabled()) return;
+    injectPresetEntryButtons();
+  }, delay);
+}
+
 function startPresetEntryGrouping() {
   const tryStart = () => {
     if (!isPresetFeatureEnabled()) return;
@@ -1612,8 +1647,13 @@ function startPresetEntryGrouping() {
     }
     bindPresetEntrySortEvents(list);
     if (!state.presetEntryObserver) {
-      state.presetEntryObserver = new MutationObserver(() => {
-        if (!state.applyingPresetEntryGroups) schedulePresetEntryRender();
+      state.presetEntryObserver = new MutationObserver(mutations => {
+        if (state.applyingPresetEntryGroups) return;
+        if (shouldRenderPresetEntryMutations(mutations, list)) {
+          schedulePresetEntryRender();
+        } else {
+          schedulePresetEntryButtonInjection();
+        }
       });
       state.presetEntryObserver.observe(list, { childList: true, subtree: true });
     }
@@ -1637,6 +1677,10 @@ function destroyPresetEntryGrouping() {
   if (state.presetEntryTimer) {
     clearTimeout(state.presetEntryTimer);
     state.presetEntryTimer = null;
+  }
+  if (state.presetEntryButtonTimer) {
+    clearTimeout(state.presetEntryButtonTimer);
+    state.presetEntryButtonTimer = null;
   }
   state.presetEntryObserver?.disconnect();
   state.presetEntryObserver = null;
