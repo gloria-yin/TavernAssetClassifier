@@ -1,5 +1,5 @@
-import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
-import { getContext } from '../../../../scripts/extensions.js';
+import { eventSource, event_types, getRequestHeaders, getThumbnailUrl, name1, saveSettingsDebounced, setUserAvatar, setUserName, user_avatar } from '../../../../script.js';
+import { getContext, writeExtensionField } from '../../../../scripts/extensions.js';
 import { background_settings, getBackgroundPath } from '../../../../scripts/backgrounds.js';
 import { promptManager } from '../../../../scripts/openai.js';
 import { getThemeObject, power_user } from '../../../../scripts/power-user.js';
@@ -46,6 +46,10 @@ const state = {
   presetEntryDragPoint: null,
   presetEntryPointerBound: false,
   applyingPresetEntryGroups: false,
+  characterBindingTimer: null,
+  characterBindingRenderTimer: null,
+  applyingCharacterBinding: false,
+  lastAppliedCharacterBindingKey: '',
 };
 
 function notify(type, message) {
@@ -86,7 +90,7 @@ function trapModalEvents(overlay) {
 
 function closeModalOverlay(overlay) {
   overlay.remove();
-  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-auto-modal')) {
+  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-auto-modal, #tac-binding-modal')) {
     document.body.classList.remove('tac-modal-open');
   }
 }
@@ -163,6 +167,106 @@ function snapshotThemeOptions() {
 function getThemeNames() {
   if (!state.allThemeOptions.length) snapshotThemeOptions();
   return state.allThemeOptions.map(option => option.value).filter(Boolean);
+}
+
+function cloneData(value) {
+  if (globalThis.structuredClone) return globalThis.structuredClone(value);
+  return JSON.parse(JSON.stringify(value ?? null));
+}
+
+function makeBindingId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `tac-binding-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function getCurrentCharacterContext() {
+  const context = getContext();
+  const id = context.characterId;
+  const character = id !== undefined ? context.characters?.[id] : null;
+  return { context, id, character };
+}
+
+function getCurrentCharacterKey() {
+  const { id, character } = getCurrentCharacterContext();
+  return character ? `${id}:${character.avatar || character.name || ''}` : '';
+}
+
+function normalizeCharacterBindings(bindings = {}) {
+  const root = bindings && typeof bindings === 'object' ? bindings : {};
+  const presets = root.presets && typeof root.presets === 'object' ? root.presets : {};
+  const users = root.users && typeof root.users === 'object' ? root.users : {};
+  const beautify = root.beautify && typeof root.beautify === 'object' ? root.beautify : {};
+  return {
+    version: 1,
+    presets: {
+      starredId: normalizeTag(presets.starredId),
+      items: Array.isArray(presets.items) ? presets.items.filter(Boolean).map(item => ({
+        id: String(item.id || makeBindingId()),
+        name: normalizeTag(item.name) || '未命名预设绑定',
+        createdAt: normalizeTag(item.createdAt),
+        presetName: normalizeTag(item.presetName),
+        presetValue: normalizeTag(item.presetValue),
+        promptOrder: Array.isArray(item.promptOrder) ? cloneData(item.promptOrder) : [],
+        presetEntryKey: normalizeTag(item.presetEntryKey),
+        presetEntryStore: item.presetEntryStore && typeof item.presetEntryStore === 'object'
+          ? cloneData(item.presetEntryStore)
+          : { groups: [] },
+      })) : [],
+    },
+    beautify: {
+      themeName: normalizeTag(beautify.themeName),
+      updatedAt: normalizeTag(beautify.updatedAt),
+    },
+    users: {
+      starredId: normalizeTag(users.starredId),
+      items: Array.isArray(users.items) ? users.items.filter(Boolean).map(item => ({
+        id: String(item.id || makeBindingId()),
+        name: normalizeTag(item.name) || '未命名 user 绑定',
+        createdAt: normalizeTag(item.createdAt),
+        avatar: normalizeTag(item.avatar),
+        userName: normalizeTag(item.userName),
+      })) : [],
+    },
+  };
+}
+
+function getCurrentCharacterBindings() {
+  const { character } = getCurrentCharacterContext();
+  return normalizeCharacterBindings(character?.data?.extensions?.[EXTENSION_KEY]);
+}
+
+async function saveCurrentCharacterBindings(bindings) {
+  const { id, character } = getCurrentCharacterContext();
+  if (id === undefined || !character) {
+    notify('info', '请先打开一张角色卡。');
+    return false;
+  }
+  const normalized = normalizeCharacterBindings(bindings);
+  try {
+    await writeExtensionField(id, EXTENSION_KEY, normalized);
+    scheduleCharacterBindingRender();
+    return true;
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to save character bindings', error);
+    notify('error', '保存角色绑定失败，请检查控制台。');
+    return false;
+  }
+}
+
+function getCurrentPromptPresetSelect() {
+  const preferredSelectors = [
+    '#settings_preset_openai',
+    '#settings_preset_textgenerationwebui',
+    '#settings_preset_novel',
+    'select[id*="preset"][id*="openai"]',
+    'select[id*="preset"][id*="completion"]',
+  ];
+  for (const selector of preferredSelectors) {
+    const select = document.querySelector(selector);
+    const value = String(select?.value || '').trim();
+    if (value) return select;
+  }
+  return null;
 }
 
 function getCurrentThemeName() {
@@ -618,7 +722,7 @@ function requestAutoDetectConfirmation(items) {
     document.body.classList.add('tac-modal-open');
     trapModalEvents(overlay);
     overlay.innerHTML = `
-      <div class="tac-modal-card tac-rename-card">
+      <div class="tac-modal-card tac-rename-card tac-binding-form-card">
         <div class="tac-modal-head">
           <div>
             <div class="tac-modal-kicker">自动识别</div>
@@ -1027,7 +1131,7 @@ function requestThemeName(oldName) {
     document.body.classList.add('tac-modal-open');
     trapModalEvents(overlay);
     overlay.innerHTML = `
-      <div class="tac-modal-card tac-rename-card">
+      <div class="tac-modal-card tac-rename-card tac-binding-form-card">
         <div class="tac-modal-head">
           <div>
             <div class="tac-modal-kicker">重命名主题</div>
@@ -1158,19 +1262,22 @@ function makePresetEntryGroupId() {
 }
 
 function getCurrentPromptPresetName() {
-  const preferredSelectors = [
-    '#settings_preset_openai',
-    '#settings_preset_textgenerationwebui',
-    '#settings_preset_novel',
-    'select[id*="preset"][id*="openai"]',
-    'select[id*="preset"][id*="completion"]',
-  ];
-  for (const selector of preferredSelectors) {
-    const select = document.querySelector(selector);
-    const value = String(select?.value || '').trim();
-    if (value) return value;
+  const select = getCurrentPromptPresetSelect();
+  const selected = select?.selectedOptions?.[0];
+  return normalizeTag(selected?.textContent || select?.value);
+}
+
+function getCurrentPromptPresetValue() {
+  return normalizeTag(getCurrentPromptPresetSelect()?.value);
+}
+
+function getPresetBindingDisplayName(binding) {
+  const select = getCurrentPromptPresetSelect();
+  if (binding?.presetValue && select) {
+    const option = Array.from(select.options).find(item => item.value === binding.presetValue);
+    if (option) return normalizeTag(option.textContent || option.value);
   }
-  return '';
+  return normalizeTag(binding?.presetName || binding?.presetValue || '未知');
 }
 
 function getPresetEntryGroupKey() {
@@ -1198,6 +1305,357 @@ function getPresetEntryStore() {
       memberIdentifiers: [...new Set(group.memberIdentifiers.map(value => String(value || '').trim()).filter(Boolean))],
     }));
   return store;
+}
+
+function getCurrentPromptOrderSnapshot() {
+  const manager = promptManager;
+  const character = manager?.activeCharacter;
+  if (!manager?.getPromptOrderForCharacter || !character) return [];
+  return cloneData(manager.getPromptOrderForCharacter(character));
+}
+
+function capturePresetBinding(name) {
+  return {
+    id: makeBindingId(),
+    name,
+    createdAt: new Date().toISOString(),
+    presetName: getCurrentPromptPresetName(),
+    presetValue: getCurrentPromptPresetValue(),
+    promptOrder: getCurrentPromptOrderSnapshot(),
+    presetEntryKey: getPresetEntryGroupKey(),
+    presetEntryStore: cloneData(getPresetEntryStore()),
+  };
+}
+
+function captureUserBinding(name) {
+  return {
+    id: makeBindingId(),
+    name,
+    createdAt: new Date().toISOString(),
+    avatar: normalizeTag(user_avatar),
+    userName: normalizeTag(name1),
+  };
+}
+
+async function requestBindingName(title, defaultValue) {
+  return new Promise(resolve => {
+    const existing = document.querySelector('#tac-binding-modal');
+    if (existing) closeModalOverlay(existing);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tac-binding-modal';
+    overlay.className = 'tac-binding-form-modal';
+    document.body.classList.add('tac-modal-open');
+    trapModalEvents(overlay);
+    overlay.innerHTML = `
+      <div class="tac-modal-card tac-rename-card">
+        <div class="tac-modal-head">
+          <div>
+            <div class="tac-modal-kicker">角色绑定</div>
+            <div class="tac-modal-title"></div>
+          </div>
+          <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <div class="tac-rename-body">
+          <input class="text_pole tac-rename-input" autocomplete="off">
+        </div>
+        <div class="tac-modal-actions">
+          <button type="button" class="menu_button" data-action="cancel">取消</button>
+          <button type="button" class="menu_button" data-action="confirm">保存</button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector('.tac-modal-title').textContent = title;
+    const input = overlay.querySelector('.tac-rename-input');
+    input.value = defaultValue || '';
+
+    const close = value => {
+      closeModalOverlay(overlay);
+      resolve(normalizeTag(value));
+    };
+
+    overlay.addEventListener('click', event => {
+      if (event.target.closest('[data-action="cancel"]')) close('');
+      if (event.target.closest('[data-action="confirm"]')) close(input.value);
+    });
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') close(input.value);
+      if (event.key === 'Escape') close('');
+    });
+
+    document.body.append(overlay);
+    const isMobileViewport = window.matchMedia?.('(max-width: 700px)')?.matches || navigator.maxTouchPoints > 0;
+    if (!isMobileViewport) {
+      setTimeout(() => input.focus(), 0);
+    }
+  });
+}
+
+async function savePresetBinding() {
+  const presetName = getCurrentPromptPresetName();
+  if (!presetName) {
+    notify('info', '当前没有可保存的预设。');
+    return;
+  }
+  const name = await requestBindingName('预设绑定名称', presetName);
+  if (!name) return;
+  const bindings = getCurrentCharacterBindings();
+  bindings.presets.items.unshift(capturePresetBinding(name));
+  if (!bindings.presets.starredId) bindings.presets.starredId = bindings.presets.items[0].id;
+  if (await saveCurrentCharacterBindings(bindings)) notify('success', '预设绑定已保存到当前角色卡。');
+}
+
+async function saveUserBinding() {
+  const name = await requestBindingName('user 绑定名称', normalizeTag(name1) || '当前 user');
+  if (!name) return;
+  const bindings = getCurrentCharacterBindings();
+  bindings.users.items.unshift(captureUserBinding(name));
+  if (!bindings.users.starredId) bindings.users.starredId = bindings.users.items[0].id;
+  if (await saveCurrentCharacterBindings(bindings)) notify('success', 'user 绑定已保存到当前角色卡。');
+}
+
+async function saveBeautifyBinding(themeName = getCurrentThemeName()) {
+  const normalized = normalizeTag(themeName);
+  if (!normalized) {
+    notify('info', '当前没有可绑定的美化。');
+    return;
+  }
+  const bindings = getCurrentCharacterBindings();
+  bindings.beautify.themeName = normalized;
+  bindings.beautify.updatedAt = new Date().toISOString();
+  if (await saveCurrentCharacterBindings(bindings)) notify('success', `已绑定美化：${normalized}`);
+}
+
+async function clearBeautifyBinding() {
+  const bindings = getCurrentCharacterBindings();
+  bindings.beautify.themeName = '';
+  bindings.beautify.updatedAt = new Date().toISOString();
+  if (await saveCurrentCharacterBindings(bindings)) notify('success', '已取消角色卡美化绑定。');
+}
+
+function openBeautifyBindingPicker() {
+  const names = getThemeNames();
+  if (!names.length) {
+    notify('info', '当前没有可选择的美化。');
+    return;
+  }
+
+  const existing = document.querySelector('#tac-binding-modal');
+  if (existing) closeModalOverlay(existing);
+
+  const bindings = getCurrentCharacterBindings();
+  const currentTheme = normalizeTag(bindings.beautify.themeName || getCurrentThemeName());
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-binding-modal';
+  document.body.classList.add('tac-modal-open');
+  trapModalEvents(overlay);
+  overlay.innerHTML = `
+    <div class="tac-modal-card tac-binding-picker-card">
+      <div class="tac-modal-head">
+        <div>
+          <div class="tac-modal-kicker">角色绑定</div>
+          <div class="tac-modal-title">选择美化</div>
+        </div>
+        <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+      <div class="tac-binding-picker-list"></div>
+    </div>
+  `;
+
+  const list = overlay.querySelector('.tac-binding-picker-list');
+  names.forEach(name => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `tac-binding-picker-item${name === currentTheme ? ' is-selected' : ''}`;
+    item.innerHTML = `
+      <span class="tac-binding-picker-name"></span>
+      <span class="tac-binding-picker-state"></span>
+    `;
+    item.querySelector('.tac-binding-picker-name').textContent = name;
+    item.querySelector('.tac-binding-picker-state').textContent = name === currentTheme ? '当前' : '';
+    item.addEventListener('click', async () => {
+      await saveBeautifyBinding(name);
+      closeModalOverlay(overlay);
+    });
+    list.append(item);
+  });
+
+  overlay.addEventListener('click', event => {
+    if (event.target.closest('[data-action="cancel"]')) closeModalOverlay(overlay);
+  });
+  document.body.append(overlay);
+}
+
+async function applyPresetBinding(binding, { automatic = false } = {}) {
+  if (!binding) return false;
+  const select = getCurrentPromptPresetSelect();
+  const matchedOption = select ? Array.from(select.options).find(option => (
+    (binding.presetValue && option.value === binding.presetValue)
+      || (binding.presetName && normalizeTag(option.textContent) === binding.presetName)
+      || (binding.presetName && option.value === binding.presetName)
+  )) : null;
+  if (matchedOption) {
+    select.value = matchedOption.value;
+    const jquery = window.jQuery || window.$;
+    if (jquery) {
+      jquery(select).trigger('change');
+    } else {
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    await new Promise(resolve => setTimeout(resolve, 350));
+  } else if ((binding.presetName || binding.presetValue) && !automatic) {
+    notify('warning', `找不到预设：${getPresetBindingDisplayName(binding)}`);
+  }
+
+  const manager = promptManager;
+  const character = manager?.activeCharacter;
+  if (character && Array.isArray(binding.promptOrder) && binding.promptOrder.length && manager?.removePromptOrderForCharacter && manager?.addPromptOrderForCharacter) {
+    manager.removePromptOrderForCharacter(character);
+    manager.addPromptOrderForCharacter(character, cloneData(binding.promptOrder));
+    manager.saveServiceSettings?.();
+    manager.render?.(false);
+  }
+
+  if (binding.presetEntryStore && typeof binding.presetEntryStore === 'object') {
+    const settings = getSettings();
+    settings.presetEntryGroups[getPresetEntryGroupKey()] = cloneData(binding.presetEntryStore);
+    saveSettings();
+    schedulePresetEntryRender(0);
+  }
+  if (!automatic) notify('success', `已应用预设绑定：${binding.name}`);
+  return true;
+}
+
+async function applyUserBinding(binding, { automatic = false } = {}) {
+  if (!binding) return false;
+  if (binding.avatar && power_user.personas?.[binding.avatar]) {
+    await setUserAvatar(binding.avatar, { toastPersonaNameChange: !automatic, navigateToCurrent: false });
+  } else if (binding.avatar && !automatic) {
+    notify('warning', `找不到 user 头像：${binding.avatar}`);
+  }
+  if (binding.userName) {
+    setUserName(binding.userName, { toastPersonaNameChange: !automatic });
+  }
+  if (!automatic) notify('success', `已应用 user 绑定：${binding.name}`);
+  return true;
+}
+
+function applyBeautifyBinding(themeName, { automatic = false } = {}) {
+  const normalized = normalizeTag(themeName);
+  if (!normalized) return false;
+  if (!getThemeNames().includes(normalized)) {
+    if (!automatic) notify('warning', `找不到美化：${normalized}`);
+    return false;
+  }
+  selectTheme(normalized);
+  if (!automatic) notify('success', `已应用角色卡美化：${normalized}`);
+  return true;
+}
+
+async function deleteCharacterBinding(type, id) {
+  const bindings = getCurrentCharacterBindings();
+  const bucket = bindings[type];
+  if (!bucket?.items) return;
+  const item = bucket.items.find(entry => entry.id === id);
+  const confirmed = await requestDeleteBindingConfirmation(type, item?.name || '');
+  if (!confirmed) return;
+  bucket.items = bucket.items.filter(item => item.id !== id);
+  if (bucket.starredId === id) bucket.starredId = bucket.items[0]?.id || '';
+  await saveCurrentCharacterBindings(bindings);
+}
+
+function requestDeleteBindingConfirmation(type, name) {
+  return new Promise(resolve => {
+    const existing = document.querySelector('#tac-binding-modal');
+    if (existing) closeModalOverlay(existing);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tac-binding-modal';
+    overlay.className = 'tac-binding-form-modal';
+    document.body.classList.add('tac-modal-open');
+    trapModalEvents(overlay);
+    overlay.innerHTML = `
+      <div class="tac-modal-card tac-rename-card">
+        <div class="tac-modal-head">
+          <div>
+            <div class="tac-modal-kicker">删除绑定</div>
+            <div class="tac-modal-title"></div>
+          </div>
+          <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <div class="tac-confirm-body"></div>
+        <div class="tac-modal-actions">
+          <button type="button" class="menu_button" data-action="cancel">取消</button>
+          <button type="button" class="menu_button danger_button" data-action="confirm">删除</button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector('.tac-modal-title').textContent = type === 'presets' ? '删除预设绑定' : '删除 user 绑定';
+    overlay.querySelector('.tac-confirm-body').textContent = name ? `确定删除“${name}”？` : '确定删除这条绑定？';
+
+    const close = value => {
+      closeModalOverlay(overlay);
+      resolve(value);
+    };
+
+    overlay.addEventListener('click', event => {
+      if (event.target.closest('[data-action="cancel"]')) close(false);
+      if (event.target.closest('[data-action="confirm"]')) close(true);
+    });
+    document.body.append(overlay);
+  });
+}
+
+async function starCharacterBinding(type, id) {
+  const bindings = getCurrentCharacterBindings();
+  const bucket = bindings[type];
+  if (!bucket) return;
+  bucket.starredId = bucket.starredId === id ? '' : id;
+  await saveCurrentCharacterBindings(bindings);
+}
+
+async function applyStarredCharacterBindings() {
+  if (state.applyingCharacterBinding) return;
+  const key = getCurrentCharacterKey();
+  if (!key || state.lastAppliedCharacterBindingKey === key) return;
+  state.applyingCharacterBinding = true;
+  state.lastAppliedCharacterBindingKey = key;
+  try {
+    const bindings = getCurrentCharacterBindings();
+    if (bindings.beautify.themeName) {
+      applyBeautifyBinding(bindings.beautify.themeName, { automatic: true });
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+    const preset = bindings.presets.items.find(item => item.id === bindings.presets.starredId);
+    if (preset) await applyPresetBinding(preset, { automatic: true });
+    const user = bindings.users.items.find(item => item.id === bindings.users.starredId);
+    if (user) await applyUserBinding(user, { automatic: true });
+  } finally {
+    state.applyingCharacterBinding = false;
+    scheduleCharacterBindingRender();
+  }
+}
+
+function scheduleCharacterBindingApply(delay = 500) {
+  clearTimeout(state.characterBindingTimer);
+  state.characterBindingTimer = setTimeout(() => {
+    state.characterBindingTimer = null;
+    applyStarredCharacterBindings();
+  }, delay);
+}
+
+function scheduleCharacterBindingRender(delay = 80) {
+  clearTimeout(state.characterBindingRenderTimer);
+  state.characterBindingRenderTimer = setTimeout(() => {
+    state.characterBindingRenderTimer = null;
+    renderCharacterBindingPanel();
+  }, delay);
 }
 
 function cleanupPresetEntryGrouping(list = getPromptList()) {
@@ -1922,6 +2380,149 @@ function getExtensionSettingsHost() {
   return document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
 }
 
+function makeBindingButton(icon, title, onClick, extraClass = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `menu_button tac-binding-icon ${extraClass}`.trim();
+  button.title = title;
+  button.innerHTML = `<i class="${icon.includes(' ') ? icon : `fa-solid ${icon}`}"></i>`;
+  button.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    onClick?.();
+  });
+  return button;
+}
+
+function makeBindingListItem(type, item, starredId) {
+  const row = document.createElement('div');
+  row.className = `tac-binding-item${type === 'users' ? ' tac-binding-user-item' : ''}${starredId === item.id ? ' is-starred' : ''}`;
+
+  if (type === 'users') {
+    const avatar = document.createElement('div');
+    avatar.className = 'tac-binding-user-avatar';
+    if (item.avatar) {
+      const image = document.createElement('img');
+      image.alt = '';
+      image.src = getThumbnailUrl('persona', item.avatar);
+      avatar.append(image);
+    } else {
+      avatar.innerHTML = '<i class="fa-solid fa-user"></i>';
+    }
+    row.append(avatar);
+  }
+
+  const main = document.createElement('div');
+  main.className = 'tac-binding-item-main';
+  const title = document.createElement('div');
+  title.className = 'tac-binding-item-title';
+  title.textContent = item.name;
+  const meta = document.createElement('div');
+  meta.className = 'tac-binding-item-meta';
+  if (type === 'presets') {
+    meta.textContent = getPresetBindingDisplayName(item);
+  } else {
+    meta.textContent = item.userName || '未记录角色名';
+  }
+  main.append(title, meta);
+
+  const actions = document.createElement('div');
+  actions.className = 'tac-binding-item-actions';
+  actions.append(
+    makeBindingButton(starredId === item.id ? 'fa-star' : 'fa-regular fa-star', starredId === item.id ? '取消自动加载' : '标为自动加载', () => starCharacterBinding(type, item.id)),
+    makeBindingButton('fa-right-to-bracket', '应用绑定', () => type === 'presets' ? applyPresetBinding(item) : applyUserBinding(item)),
+    makeBindingButton('fa-trash', '删除绑定', () => deleteCharacterBinding(type, item.id)),
+  );
+  row.append(main, actions);
+  return row;
+}
+
+function renderPresetBindingModule(bindings) {
+  const section = document.createElement('section');
+  section.className = 'tac-binding-module';
+  section.innerHTML = `
+    <div class="tac-binding-module-head">
+      <div class="tac-binding-module-title"><i class="fa-solid fa-sliders"></i> 预设绑定</div>
+      <button type="button" class="menu_button tac-binding-save" title="保存预设绑定"><i class="fa-solid fa-floppy-disk"></i><span>保存</span></button>
+    </div>
+    <div class="tac-binding-list"></div>
+  `;
+  section.querySelector('.tac-binding-save')?.addEventListener('click', savePresetBinding);
+  const list = section.querySelector('.tac-binding-list');
+  if (bindings.presets.items.length) {
+    bindings.presets.items.forEach(item => list.append(makeBindingListItem('presets', item, bindings.presets.starredId)));
+  } else {
+    list.innerHTML = '<div class="tac-binding-empty">还没有保存预设绑定。</div>';
+  }
+  return section;
+}
+
+function renderBeautifyBindingModule(bindings) {
+  const section = document.createElement('section');
+  section.className = 'tac-binding-module';
+  section.innerHTML = `
+    <div class="tac-binding-module-head">
+      <div class="tac-binding-module-title"><i class="fa-solid fa-palette"></i> 美化绑定</div>
+    </div>
+    <div class="tac-binding-current"></div>
+    <div class="tac-binding-button-row">
+      <button type="button" class="menu_button" data-action="choose" title="选择美化"><i class="fa-solid fa-list"></i><span>选择</span></button>
+      <button type="button" class="menu_button" data-action="save-current" title="保存当前美化"><i class="fa-solid fa-floppy-disk"></i><span>当前</span></button>
+      <button type="button" class="menu_button" data-action="clear" title="取消绑定"><i class="fa-solid fa-link-slash"></i><span>取消</span></button>
+    </div>
+  `;
+  const current = section.querySelector('.tac-binding-current');
+  current.textContent = bindings.beautify.themeName ? `当前绑定：${bindings.beautify.themeName}` : '当前未绑定角色卡美化。';
+  section.querySelector('[data-action="save-current"]')?.addEventListener('click', () => saveBeautifyBinding(getCurrentThemeName()));
+  section.querySelector('[data-action="choose"]')?.addEventListener('click', openBeautifyBindingPicker);
+  section.querySelector('[data-action="clear"]')?.addEventListener('click', clearBeautifyBinding);
+  return section;
+}
+
+function renderUserBindingModule(bindings) {
+  const section = document.createElement('section');
+  section.className = 'tac-binding-module';
+  section.innerHTML = `
+    <div class="tac-binding-module-head">
+      <div class="tac-binding-module-title"><i class="fa-solid fa-user"></i> user 绑定</div>
+      <button type="button" class="menu_button tac-binding-save" title="保存 user 绑定"><i class="fa-solid fa-floppy-disk"></i><span>保存</span></button>
+    </div>
+    <div class="tac-binding-list"></div>
+  `;
+  section.querySelector('.tac-binding-save')?.addEventListener('click', saveUserBinding);
+  const list = section.querySelector('.tac-binding-list');
+  if (bindings.users.items.length) {
+    bindings.users.items.forEach(item => list.append(makeBindingListItem('users', item, bindings.users.starredId)));
+  } else {
+    list.innerHTML = '<div class="tac-binding-empty">还没有保存 user 绑定。</div>';
+  }
+  return section;
+}
+
+function renderCharacterBindingPanel() {
+  const body = document.querySelector('#tac-character-binding-body');
+  if (!body) return;
+  const { character } = getCurrentCharacterContext();
+  body.innerHTML = '';
+  if (!character) {
+    body.innerHTML = '<div class="tac-binding-empty">打开角色卡后可以保存和加载绑定。</div>';
+    return;
+  }
+  const bindings = getCurrentCharacterBindings();
+  const status = document.createElement('div');
+  status.className = 'tac-binding-character-status';
+  status.innerHTML = `<i class="fa-solid fa-id-card"></i><span></span>`;
+  status.querySelector('span').textContent = `当前角色：${character.name || character.avatar || '未命名角色'}`;
+  const grid = document.createElement('div');
+  grid.className = 'tac-binding-grid';
+  grid.append(
+    renderPresetBindingModule(bindings),
+    renderBeautifyBindingModule(bindings),
+    renderUserBindingModule(bindings),
+  );
+  body.append(status, grid);
+}
+
 function renderFeatureSettingsPanel() {
   const settings = getFeatureSettings();
   const panel = document.createElement('div');
@@ -1945,6 +2546,13 @@ function renderFeatureSettingsPanel() {
             <small>预设分类</small>
           </label>
         </div>
+        <details id="tac-character-binding-panel" class="tac-settings-card tac-character-binding-panel">
+          <summary>
+            <span><i class="fa-solid fa-link"></i> 角色绑定</span>
+            <i class="fa-solid fa-chevron-down tac-chevron"></i>
+          </summary>
+          <div id="tac-character-binding-body"></div>
+        </details>
       </div>
     </div>
   `;
@@ -1956,6 +2564,7 @@ function renderFeatureSettingsPanel() {
     saveSettings();
     applyFeatureState();
   });
+  setTimeout(renderCharacterBindingPanel, 0);
   return panel;
 }
 
@@ -1966,11 +2575,13 @@ function mountFeatureSettingsPanel() {
     const presets = existing.querySelector('input[data-feature="presets"]');
     if (beautify) beautify.checked = isBeautifyFeatureEnabled();
     if (presets) presets.checked = isPresetFeatureEnabled();
+    renderCharacterBindingPanel();
     return true;
   }
   const host = getExtensionSettingsHost();
   if (!host) return false;
   host.append(renderFeatureSettingsPanel());
+  renderCharacterBindingPanel();
   return true;
 }
 
@@ -1996,9 +2607,19 @@ function applyFeatureState() {
   }
 }
 
+function handleCharacterBindingContextChanged() {
+  state.lastAppliedCharacterBindingKey = '';
+  scheduleCharacterBindingRender();
+  scheduleCharacterBindingApply();
+}
+
 function start() {
   startFeatureSettingsPanel();
   applyFeatureState();
+  eventSource?.on?.(event_types.APP_READY, handleCharacterBindingContextChanged);
+  eventSource?.on?.(event_types.CHAT_CHANGED, handleCharacterBindingContextChanged);
+  eventSource?.on?.(event_types.CHARACTER_EDITED, scheduleCharacterBindingRender);
+  scheduleCharacterBindingApply(900);
 }
 
 if (document.readyState === 'loading') {
