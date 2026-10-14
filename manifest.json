@@ -1,5 +1,5 @@
 {
-  "display_name": "Tavern Asset Classifier",
+  "display_name": "ST分类器",
   "loading_order": 101,
   "requires": [],
   "optional": [],

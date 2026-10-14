@@ -1,8 +1,10 @@
-import { eventSource, event_types, getRequestHeaders, getThumbnailUrl, name1, saveSettingsDebounced, setUserAvatar, setUserName, user_avatar } from '../../../../script.js';
+import { eventSource, event_types, getRequestHeaders, getThumbnailUrl, name1, saveSettingsDebounced, selectCharacterById, setUserAvatar, setUserName, unshallowCharacter, user_avatar } from '../../../../script.js';
 import { getContext, writeExtensionField } from '../../../../scripts/extensions.js';
 import { background_settings, getBackgroundPath } from '../../../../scripts/backgrounds.js';
 import { promptManager } from '../../../../scripts/openai.js';
 import { getThemeObject, power_user } from '../../../../scripts/power-user.js';
+import { charSetAuxWorlds, getWorldInfoSettings, loadWorldInfo, saveWorldInfo, selected_world_info, updateWorldInfoList, updateWorldInfoSettings, world_info } from '../../../../scripts/world-info.js';
+import { getCharaFilename } from '../../../../scripts/utils.js';
 
 const EXTENSION_KEY = 'tavernAssetClassifier';
 const COLOR_TAGS = [
@@ -30,24 +32,23 @@ const CATEGORY_LABELS = {
 
 const state = {
   selectedFilters: [],
+  themeSearchQuery: '',
+  autoMetadataScanStarted: false,
+  batchThemeImportActive: false,
+  sessionImportedThemeValues: [],
+  themePickerCleanup: null,
   observer: null,
+  themeObserverReleaseTimer: null,
   refreshTimer: null,
   allThemeOptions: [],
   suppressThemeObserver: false,
   themeBackgroundSyncTimer: null,
   themeBackgroundSyncBound: false,
   lastThemeBackgroundSyncName: '',
-  presetEntryObserver: null,
-  presetEntryBodyObserver: null,
-  presetEntryTimer: null,
-  presetEntryButtonTimer: null,
-  presetEntryFrame: null,
-  presetEntrySelection: null,
-  presetEntryDragPoint: null,
-  presetEntryPointerBound: false,
-  applyingPresetEntryGroups: false,
   characterBindingTimer: null,
   characterBindingRenderTimer: null,
+  characterBindingQuery: '',
+  characterRelationDeleteMode: false,
   applyingCharacterBinding: false,
   lastAppliedCharacterBindingKey: '',
 };
@@ -71,11 +72,6 @@ function escapeHtml(value) {
   }[character]));
 }
 
-function escapeCssIdentifier(value) {
-  if (window.CSS?.escape) return CSS.escape(value);
-  return String(value ?? '').replace(/["\\]/g, '\\$&');
-}
-
 function trapModalEvents(overlay) {
   const eventNames = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'touchstart', 'touchend', 'contextmenu', 'wheel'];
   eventNames.forEach(eventName => {
@@ -90,9 +86,16 @@ function trapModalEvents(overlay) {
 
 function closeModalOverlay(overlay) {
   overlay.remove();
-  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-auto-modal, #tac-binding-modal')) {
+  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-binding-modal')) {
     document.body.classList.remove('tac-modal-open');
+    document.documentElement.classList.remove('tac-modal-open');
   }
+}
+
+function mountModalOverlay(overlay) {
+  document.body.classList.add('tac-modal-open');
+  document.documentElement.classList.add('tac-modal-open');
+  document.documentElement.append(overlay);
 }
 
 function getSettings(create = true) {
@@ -104,15 +107,6 @@ function getSettings(create = true) {
   }
   const settings = root[EXTENSION_KEY];
   if (!settings.files || typeof settings.files !== 'object') settings.files = {};
-  if (!settings.presetEntryGroups || typeof settings.presetEntryGroups !== 'object') settings.presetEntryGroups = {};
-  if (!settings.features || typeof settings.features !== 'object') {
-    settings.features = {
-      beautify: false,
-      presets: false,
-    };
-  }
-  settings.features.beautify = Boolean(settings.features.beautify);
-  settings.features.presets = Boolean(settings.features.presets);
   return settings;
 }
 
@@ -124,24 +118,52 @@ function saveSettings() {
   }
 }
 
-function getFeatureSettings() {
-  return getSettings()?.features ?? { beautify: false, presets: false };
-}
-
-function isBeautifyFeatureEnabled() {
-  return Boolean(getFeatureSettings().beautify);
-}
-
-function isPresetFeatureEnabled() {
-  return Boolean(getFeatureSettings().presets);
-}
-
 function normalizeTag(value) {
   return String(value ?? '').trim();
 }
 
 function uniqueTags(tags) {
   return [...new Set((tags ?? []).map(normalizeTag).filter(Boolean))];
+}
+
+function normalizeThemeNameKey(value) {
+  return normalizeTag(value).toLocaleLowerCase('zh-Hans-CN');
+}
+
+function getKnownThemeNameKeys() {
+  const settings = getSettings(false);
+  const names = new Set(Object.keys(settings?.files ?? {}).map(normalizeThemeNameKey).filter(Boolean));
+  state.allThemeOptions.forEach(option => {
+    [option.value, option.text].map(normalizeThemeNameKey).filter(Boolean).forEach(name => names.add(name));
+  });
+  return names;
+}
+
+function isThemeNameTag(tag, themeNames = getKnownThemeNameKeys()) {
+  return themeNames.has(normalizeThemeNameKey(tag));
+}
+
+function sanitizeStoredThemeNameTags() {
+  const settings = getSettings(false);
+  if (!settings?.files) return false;
+  const themeNames = getKnownThemeNameKeys();
+  let changed = false;
+
+  Object.values(settings.files).forEach(record => {
+    if (!record || typeof record !== 'object') return;
+    ['style', 'topic'].forEach(category => {
+      const current = uniqueTags(record[category]);
+      const filtered = current.filter(tag => !isThemeNameTag(tag, themeNames));
+      if (filtered.length !== current.length) changed = true;
+      record[category] = filtered;
+    });
+  });
+
+  if (changed) {
+    state.selectedFilters = state.selectedFilters.filter(filter => !isThemeNameTag(filter.tag, themeNames));
+    saveSettings();
+  }
+  return changed;
 }
 
 function getThemeSelect() {
@@ -156,22 +178,46 @@ function snapshotThemeOptions() {
   Array.from(select.options).forEach(option => {
     const value = String(option.value || option.textContent || '').trim();
     if (!value) return;
+    const existing = merged.get(value);
     merged.set(value, {
       value,
-      text: String(option.textContent || value),
+      text: String(option.dataset.tacThemeName || existing?.text || option.textContent || value),
     });
   });
   state.allThemeOptions = Array.from(merged.values());
 }
 
+function suppressThemeObserverUntilNextTask() {
+  state.suppressThemeObserver = true;
+  clearTimeout(state.themeObserverReleaseTimer);
+  state.themeObserverReleaseTimer = setTimeout(() => {
+    state.themeObserverReleaseTimer = null;
+    state.suppressThemeObserver = false;
+  }, 0);
+}
+
 function getThemeNames() {
   if (!state.allThemeOptions.length) snapshotThemeOptions();
-  return state.allThemeOptions.map(option => option.value).filter(Boolean);
+  return getOrderedThemeOptions().map(option => option.value).filter(Boolean);
 }
 
 function cloneData(value) {
   if (globalThis.structuredClone) return globalThis.structuredClone(value);
   return JSON.parse(JSON.stringify(value ?? null));
+}
+
+function dataMatches(left, right) {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+function stringSetsMatch(left, right) {
+  const first = uniqueTags(left).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+  const second = uniqueTags(right).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+  return first.length === second.length && first.every((value, index) => value === second[index]);
 }
 
 function makeBindingId() {
@@ -195,9 +241,10 @@ function normalizeCharacterBindings(bindings = {}) {
   const root = bindings && typeof bindings === 'object' ? bindings : {};
   const presets = root.presets && typeof root.presets === 'object' ? root.presets : {};
   const users = root.users && typeof root.users === 'object' ? root.users : {};
+  const worldBooks = root.worldBooks && typeof root.worldBooks === 'object' ? root.worldBooks : {};
   const beautify = root.beautify && typeof root.beautify === 'object' ? root.beautify : {};
   return {
-    version: 1,
+    version: 3,
     presets: {
       starredId: normalizeTag(presets.starredId),
       items: Array.isArray(presets.items) ? presets.items.filter(Boolean).map(item => ({
@@ -207,16 +254,20 @@ function normalizeCharacterBindings(bindings = {}) {
         presetName: normalizeTag(item.presetName),
         presetValue: normalizeTag(item.presetValue),
         promptOrder: Array.isArray(item.promptOrder) ? cloneData(item.promptOrder) : [],
-        presetEntryKey: normalizeTag(item.presetEntryKey),
-        presetEntryStore: item.presetEntryStore && typeof item.presetEntryStore === 'object'
-          ? cloneData(item.presetEntryStore)
-          : { groups: [] },
+        updatedAt: normalizeTag(item.updatedAt),
       })) : [],
     },
     beautify: {
       themeName: normalizeTag(beautify.themeName),
       updatedAt: normalizeTag(beautify.updatedAt),
     },
+    relatedCharacters: Array.from(new Map((Array.isArray(root.relatedCharacters) ? root.relatedCharacters : [])
+      .map(item => typeof item === 'string' ? { avatar: item, name: '' } : item)
+      .filter(item => item && normalizeTag(item.avatar))
+      .map(item => [normalizeTag(item.avatar), {
+        avatar: normalizeTag(item.avatar),
+        name: normalizeTag(item.name),
+      }])).values()),
     users: {
       starredId: normalizeTag(users.starredId),
       items: Array.isArray(users.items) ? users.items.filter(Boolean).map(item => ({
@@ -226,6 +277,28 @@ function normalizeCharacterBindings(bindings = {}) {
         avatar: normalizeTag(item.avatar),
         userName: normalizeTag(item.userName),
       })) : [],
+    },
+    worldBooks: {
+      starredId: normalizeTag(worldBooks.starredId),
+      items: Array.isArray(worldBooks.items) ? worldBooks.items.filter(Boolean).map(item => {
+        const books = Array.isArray(item.books) ? item.books.filter(book => book && normalizeTag(book.name)).map(book => ({
+          name: normalizeTag(book.name),
+          data: book.data && typeof book.data === 'object' ? cloneData(book.data) : { entries: {} },
+        })) : [];
+        const hasScopedSelection = Array.isArray(item.globalBooks) || item.characterBooks;
+        return {
+          id: String(item.id || makeBindingId()),
+          name: normalizeTag(item.name) || '未命名世界书绑定',
+          createdAt: normalizeTag(item.createdAt),
+          updatedAt: normalizeTag(item.updatedAt),
+          globalBooks: uniqueTags(hasScopedSelection ? item.globalBooks : books.map(book => book.name)),
+          characterBooks: {
+            primary: normalizeTag(item.characterBooks?.primary),
+            additional: uniqueTags(item.characterBooks?.additional),
+          },
+          books,
+        };
+      }) : [],
     },
   };
 }
@@ -249,6 +322,98 @@ async function saveCurrentCharacterBindings(bindings) {
   } catch (error) {
     console.error('TavernAssetClassifier: failed to save character bindings', error);
     notify('error', '保存角色绑定失败，请检查控制台。');
+    return false;
+  }
+}
+
+function getCharacterLibrary() {
+  const context = getContext();
+  return (context.characters ?? []).map((character, id) => ({
+    id,
+    character,
+    avatar: normalizeTag(character?.avatar),
+    name: normalizeTag(character?.name) || '未命名角色',
+  })).filter(item => item.avatar);
+}
+
+function findCharacterByAvatar(avatar) {
+  const normalized = normalizeTag(avatar);
+  return getCharacterLibrary().find(item => item.avatar === normalized) ?? null;
+}
+
+async function loadCharacterByAvatar(avatar) {
+  const found = findCharacterByAvatar(avatar);
+  if (!found) return null;
+  await unshallowCharacter(found.id);
+  return findCharacterByAvatar(avatar);
+}
+
+async function collectCharacterRelationGroup(seedAvatars) {
+  const pending = uniqueTags(seedAvatars);
+  const visited = new Set();
+  while (pending.length) {
+    const avatar = pending.shift();
+    if (!avatar || visited.has(avatar)) continue;
+    visited.add(avatar);
+    const found = await loadCharacterByAvatar(avatar);
+    if (!found) continue;
+    const bindings = normalizeCharacterBindings(found.character?.data?.extensions?.[EXTENSION_KEY]);
+    bindings.relatedCharacters.forEach(item => {
+      if (!visited.has(item.avatar)) pending.push(item.avatar);
+    });
+  }
+  return Array.from(visited).map(findCharacterByAvatar).filter(Boolean);
+}
+
+async function synchronizeCharacterRelationGroup(members) {
+  const uniqueMembers = Array.from(new Map(members.filter(Boolean).map(item => [item.avatar, item])).values());
+  const references = uniqueMembers.map(item => ({ avatar: item.avatar, name: item.name }));
+  for (const member of uniqueMembers) {
+    const loaded = await loadCharacterByAvatar(member.avatar);
+    if (!loaded) continue;
+    const bindings = normalizeCharacterBindings(loaded.character?.data?.extensions?.[EXTENSION_KEY]);
+    bindings.relatedCharacters = references.filter(item => item.avatar !== loaded.avatar);
+    await writeExtensionField(loaded.id, EXTENSION_KEY, bindings);
+  }
+}
+
+async function addCharacterToRelationGroup(targetAvatar) {
+  const { character } = getCurrentCharacterContext();
+  const currentAvatar = normalizeTag(character?.avatar);
+  if (!currentAvatar || !targetAvatar || currentAvatar === targetAvatar) return false;
+  try {
+    const group = await collectCharacterRelationGroup([currentAvatar, targetAvatar]);
+    await synchronizeCharacterRelationGroup(group);
+    notify('success', `角色卡关联集合已更新，共 ${group.length} 张角色卡。`);
+    scheduleCharacterBindingRender();
+    return true;
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to add character relation', error);
+    notify('error', '添加角色卡关联失败，请检查控制台。');
+    return false;
+  }
+}
+
+async function removeCharacterFromRelationGroup(targetAvatar) {
+  const { character } = getCurrentCharacterContext();
+  const currentAvatar = normalizeTag(character?.avatar);
+  if (!currentAvatar || !targetAvatar || currentAvatar === targetAvatar) return false;
+  try {
+    const group = await collectCharacterRelationGroup([currentAvatar]);
+    const removed = group.find(item => item.avatar === targetAvatar) || await loadCharacterByAvatar(targetAvatar);
+    const remaining = group.filter(item => item.avatar !== targetAvatar);
+    await synchronizeCharacterRelationGroup(remaining);
+    if (removed) {
+      const bindings = normalizeCharacterBindings(removed.character?.data?.extensions?.[EXTENSION_KEY]);
+      bindings.relatedCharacters = [];
+      await writeExtensionField(removed.id, EXTENSION_KEY, bindings);
+    }
+    notify('success', '已从关联集合中移除角色卡。');
+    scheduleCharacterBindingRender();
+    return true;
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to remove character relation', error);
+    notify('error', '删除角色卡关联失败，请检查控制台。');
     return false;
   }
 }
@@ -296,8 +461,190 @@ function getThemeRecord(name, create = true) {
   record.topic = uniqueTags(record.topic);
   record.color = uniqueTags(record.color).filter(tag => COLOR_TAGS.some(item => item.name === tag));
   record.avatar = uniqueTags(record.avatar).filter(tag => AVATAR_TAGS.includes(tag)).slice(0, 1);
+  record.autoColorDisabled = Boolean(record.autoColorDisabled);
+  record.autoAvatarDisabled = Boolean(record.autoAvatarDisabled);
   record.background = normalizeTag(record.background);
+  record.favorite = Boolean(record.favorite);
   return record;
+}
+
+function getOrderedThemeOptions() {
+  return state.allThemeOptions
+    .map((option, index) => ({ option, index }))
+    .sort((a, b) => {
+      const firstImportIndex = state.sessionImportedThemeValues.indexOf(a.option.value);
+      const secondImportIndex = state.sessionImportedThemeValues.indexOf(b.option.value);
+      const firstIsImported = firstImportIndex !== -1;
+      const secondIsImported = secondImportIndex !== -1;
+      if (firstIsImported !== secondIsImported) return firstIsImported ? 1 : -1;
+      if (firstIsImported && secondIsImported) return firstImportIndex - secondImportIndex;
+      const favoriteDifference = Number(Boolean(getThemeRecordForTheme(b.option.value)?.favorite))
+        - Number(Boolean(getThemeRecordForTheme(a.option.value)?.favorite));
+      return favoriteDifference || a.index - b.index;
+    })
+    .map(entry => entry.option);
+}
+
+function makeThemePickerTag(category, tag) {
+  const chip = document.createElement('span');
+  chip.className = `tac-theme-picker-tag tac-theme-picker-tag-${category}`;
+  chip.title = `${CATEGORY_LABELS[category]}：${tag}`;
+  if (category === 'color') {
+    const color = getColorMeta(tag);
+    chip.setAttribute('aria-label', chip.title);
+    chip.style.setProperty('--tac-picker-color', color?.color || '#888');
+    chip.innerHTML = '<span class="tac-theme-picker-color-dot"></span>';
+    return chip;
+  }
+  if (category === 'avatar') {
+    chip.innerHTML = '<i class="fa-solid fa-user"></i><span></span>';
+  } else {
+    chip.innerHTML = '<span></span>';
+  }
+  chip.querySelector('span:last-child').textContent = tag;
+  return chip;
+}
+
+function appendThemePickerContent(container, name, fallback = name) {
+  const record = getThemeRecordForTheme(name);
+  const title = document.createElement('span');
+  title.className = 'tac-theme-picker-entry-name';
+  if (record?.favorite) {
+    const favorite = document.createElement('i');
+    favorite.className = 'fa-solid fa-star tac-theme-picker-favorite';
+    favorite.title = '已收藏';
+    title.append(favorite);
+  }
+  const titleText = document.createElement('span');
+  titleText.textContent = fallback;
+  title.append(titleText);
+
+  const tags = document.createElement('span');
+  tags.className = 'tac-theme-picker-entry-tags';
+  ['color', 'avatar', 'style', 'topic'].forEach(category => {
+    uniqueTags(record?.[category]).forEach(tag => tags.append(makeThemePickerTag(category, tag)));
+  });
+  container.replaceChildren(title, tags);
+}
+
+function positionThemePickerMenu(picker) {
+  const trigger = picker?.querySelector('.tac-theme-picker-trigger');
+  const menu = document.querySelector('#tac-theme-picker-menu');
+  if (!trigger || !menu) return;
+  const rect = trigger.getBoundingClientRect();
+  const margin = 8;
+  const spaceBelow = window.innerHeight - rect.bottom - margin;
+  const spaceAbove = rect.top - margin;
+  const openAbove = spaceBelow < 180 && spaceAbove > spaceBelow;
+  menu.style.left = `${Math.max(margin, rect.left)}px`;
+  menu.style.width = `${Math.min(rect.width, window.innerWidth - margin * 2)}px`;
+  menu.style.maxHeight = `${Math.max(96, openAbove ? spaceAbove - 4 : spaceBelow - 4)}px`;
+  menu.style.top = openAbove ? 'auto' : `${rect.bottom + 4}px`;
+  menu.style.bottom = openAbove ? `${window.innerHeight - rect.top + 4}px` : 'auto';
+}
+
+function setThemePickerOpen(picker, open) {
+  const trigger = picker?.querySelector('.tac-theme-picker-trigger');
+  const menu = document.querySelector('#tac-theme-picker-menu');
+  if (!trigger || !menu) return;
+  picker.classList.toggle('is-open', open);
+  trigger.setAttribute('aria-expanded', String(open));
+  menu.hidden = !open;
+  if (open) positionThemePickerMenu(picker);
+}
+
+function renderThemePicker() {
+  const picker = document.querySelector('#tac-theme-picker');
+  const select = getThemeSelect();
+  if (!picker || !select) return;
+  const currentValue = getCurrentThemeName();
+  const currentOption = state.allThemeOptions.find(item => item.value === currentValue);
+  const selection = picker.querySelector('.tac-theme-picker-selection');
+  appendThemePickerContent(selection, currentValue, currentOption?.text || currentValue || '选择美化');
+
+  const menu = document.querySelector('#tac-theme-picker-menu');
+  if (!menu) return;
+  menu.innerHTML = '';
+  const visibleValues = Array.from(select.options).map(option => option.value).filter(Boolean);
+  visibleValues.forEach(value => {
+    const source = state.allThemeOptions.find(item => item.value === value);
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `tac-theme-picker-item${value === currentValue ? ' is-selected' : ''}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(value === currentValue));
+    const content = document.createElement('span');
+    content.className = 'tac-theme-picker-entry';
+    appendThemePickerContent(content, value, source?.text || value);
+    const check = document.createElement('i');
+    check.className = 'fa-solid fa-check tac-theme-picker-check';
+    item.append(content, check);
+    item.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      selectTheme(value, { preserveSettingsDrawer: true });
+      setThemePickerOpen(picker, false);
+      renderThemePicker();
+    });
+    menu.append(item);
+  });
+  if (!visibleValues.length) {
+    const empty = document.createElement('div');
+    empty.className = 'tac-theme-picker-empty';
+    empty.textContent = '没有匹配的美化。';
+    menu.append(empty);
+  }
+}
+
+function mountThemePicker(themeRow) {
+  const select = getThemeSelect();
+  if (!select || document.querySelector('#tac-theme-picker')) return;
+  if (!state.allThemeOptions.length) snapshotThemeOptions();
+  sanitizeStoredThemeNameTags();
+  const picker = document.createElement('div');
+  picker.id = 'tac-theme-picker';
+  picker.className = 'tac-theme-picker';
+  picker.innerHTML = `
+    <button type="button" class="tac-theme-picker-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="tac-theme-picker-selection"></span>
+      <i class="fa-solid fa-chevron-down tac-theme-picker-chevron"></i>
+    </button>
+  `;
+  const menu = document.createElement('div');
+  menu.id = 'tac-theme-picker-menu';
+  menu.className = 'tac-theme-picker-menu';
+  menu.setAttribute('role', 'listbox');
+  menu.hidden = true;
+  select.classList.add('tac-native-theme-select');
+  themeRow.classList.add('tac-theme-picker-row');
+  select.before(picker);
+  document.documentElement.append(menu);
+
+  ['pointerdown', 'mousedown', 'mouseup', 'touchstart', 'touchend', 'click'].forEach(eventName => {
+    menu.addEventListener(eventName, event => event.stopPropagation());
+  });
+
+  picker.querySelector('.tac-theme-picker-trigger').addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    setThemePickerOpen(picker, !picker.classList.contains('is-open'));
+  });
+  const closeOnOutsidePointer = event => {
+    if (!picker.contains(event.target) && !menu.contains(event.target)) setThemePickerOpen(picker, false);
+  };
+  const closeOnEscape = event => {
+    if (event.key === 'Escape') setThemePickerOpen(picker, false);
+  };
+  const closeOnViewportChange = () => setThemePickerOpen(picker, false);
+  document.addEventListener('pointerdown', closeOnOutsidePointer);
+  document.addEventListener('keydown', closeOnEscape);
+  window.addEventListener('resize', closeOnViewportChange);
+  state.themePickerCleanup = () => {
+    document.removeEventListener('pointerdown', closeOnOutsidePointer);
+    document.removeEventListener('keydown', closeOnEscape);
+    window.removeEventListener('resize', closeOnViewportChange);
+  };
+  renderThemePicker();
 }
 
 function pruneMissingThemeRecords() {
@@ -308,6 +655,243 @@ function pruneMissingThemeRecords() {
 
 function getColorMeta(name) {
   return COLOR_TAGS.find(item => item.name === name);
+}
+
+function parseCssColor(value) {
+  const normalized = normalizeTag(value);
+  const rgba = normalized.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i);
+  if (rgba) {
+    return {
+      red: Math.min(255, Number(rgba[1])),
+      green: Math.min(255, Number(rgba[2])),
+      blue: Math.min(255, Number(rgba[3])),
+      alpha: rgba[4] === undefined ? 1 : Math.min(1, Number(rgba[4])),
+    };
+  }
+  const hex = normalized.match(/^#([\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i)?.[1];
+  if (!hex) return null;
+  const expanded = hex.length === 3 ? hex.split('').map(part => `${part}${part}`).join('') : hex;
+  return {
+    red: Number.parseInt(expanded.slice(0, 2), 16),
+    green: Number.parseInt(expanded.slice(2, 4), 16),
+    blue: Number.parseInt(expanded.slice(4, 6), 16),
+    alpha: expanded.length === 8 ? Number.parseInt(expanded.slice(6, 8), 16) / 255 : 1,
+  };
+}
+
+function getColorTagFromRgb({ red, green, blue }) {
+  const maximum = Math.max(red, green, blue) / 255;
+  const minimum = Math.min(red, green, blue) / 255;
+  const lightness = (maximum + minimum) / 2;
+  const delta = maximum - minimum;
+  const saturation = delta === 0 ? 0 : delta / (1 - Math.abs(2 * lightness - 1));
+  let hue = 0;
+  if (delta) {
+    if (maximum === red / 255) hue = 60 * (((green - blue) / 255 / delta) % 6);
+    else if (maximum === green / 255) hue = 60 * (((blue - red) / 255 / delta) + 2);
+    else hue = 60 * (((red - green) / 255 / delta) + 4);
+  }
+  if (hue < 0) hue += 360;
+  if (lightness <= 0.13) return '黑';
+  if (lightness >= 0.9 && saturation <= 0.22) return '白';
+  if (saturation <= 0.12) return lightness >= 0.78 ? '白' : lightness <= 0.24 ? '黑' : '灰';
+  if (hue >= 18 && hue < 52 && lightness < 0.48) return '棕';
+  if (hue < 16 || hue >= 345) return '红';
+  if (hue < 45) return '橙';
+  if (hue < 70) return '黄';
+  if (hue < 165) return '绿';
+  if (hue < 255) return '蓝';
+  if (hue < 300) return '紫';
+  return '粉';
+}
+
+function inferThemeColorTags(theme) {
+  const weightedFields = [
+    ['blur_tint_color', 5],
+    ['chat_tint_color', 4],
+    ['user_mes_blur_tint_color', 3.5],
+    ['bot_mes_blur_tint_color', 3.5],
+    ['main_text_color', 3],
+    ['quote_text_color', 2],
+    ['italics_text_color', 1.5],
+    ['underline_text_color', 1.5],
+    ['border_color', 1],
+  ];
+  const scores = new Map();
+  weightedFields.forEach(([field, weight]) => {
+    const color = parseCssColor(theme?.[field]);
+    if (!color || color.alpha < 0.15) return;
+    const tag = getColorTagFromRgb(color);
+    scores.set(tag, (scores.get(tag) || 0) + weight * color.alpha);
+  });
+  const ranked = Array.from(scores.entries()).sort((a, b) => b[1] - a[1]);
+  if (!ranked.length) return [];
+  const threshold = ranked[0][1] * 0.42;
+  return ranked.filter(([, score], index) => index === 0 || score >= threshold).slice(0, 2).map(([tag]) => tag);
+}
+
+function resolveCssVariable(value, variables, depth = 0) {
+  if (depth > 4) return normalizeTag(value);
+  return normalizeTag(value).replace(/var\(\s*(--[\w-]+)(?:\s*,\s*([^)]*))?\)/gi, (_match, name, fallback = '') => {
+    const replacement = variables.get(name) || fallback;
+    return resolveCssVariable(replacement, variables, depth + 1);
+  });
+}
+
+function parseCssLength(value, variables) {
+  const resolved = resolveCssVariable(value, variables);
+  const match = resolved.match(/^(-?\d*\.?\d+)\s*(px|vw|vh|vmin|vmax|cqw|cqh|rem|em|%)(?=\s|$|!)/i);
+  if (!match) return null;
+  return { value: Math.abs(Number(match[1])), unit: match[2].toLowerCase() };
+}
+
+function getThemeAvatarRuleParts(theme) {
+  const css = String(theme?.custom_css || '').replace(/\/\*[\s\S]*?\*\//g, ' ');
+  if (!css) return { rules: [], variables: new Map() };
+  const variables = new Map();
+  for (const match of css.matchAll(/(--[\w-]+)\s*:\s*([^;{}]+);/g)) {
+    variables.set(match[1], normalizeTag(match[2]));
+  }
+
+  const rules = [];
+  for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = normalizeTag(match[1].split(/[\r\n]/).pop());
+    if (!selector) continue;
+    selector.split(',').map(normalizeTag).filter(Boolean).forEach(part => {
+      const lower = part.toLowerCase();
+      const positiveSelector = part.replace(/:not\(\s*\[\s*is_user\s*=\s*["']true["']\s*\]\s*\)/gi, '');
+      const userOnly = /\[\s*is_user\s*=\s*["']true["']\s*\]/i.test(positiveSelector)
+        && !/\[\s*is_user\s*=\s*["']false["']\s*\]/i.test(positiveSelector);
+      if (userOnly) return;
+      const chatScoped = lower.includes('mesavatarwrapper') || lower.includes('#chat') || /\.mes(?:\b|\[)/i.test(part);
+      if (!chatScoped) return;
+      const avatarIndex = lower.lastIndexOf('.avatar');
+      const targetsAvatar = avatarIndex >= 0;
+      const avatarSuffix = targetsAvatar ? lower.slice(avatarIndex + '.avatar'.length) : '';
+      const targetsAvatarElement = targetsAvatar && !/^\s+(?:img|picture|source)\b/.test(avatarSuffix) && !/^::?/.test(avatarSuffix);
+      const targetsWrapper = lower.includes('mesavatarwrapper') && !targetsAvatar && !/::?/.test(lower.slice(lower.lastIndexOf('mesavatarwrapper') + 'mesavatarwrapper'.length));
+      if (!targetsAvatarElement && !targetsWrapper) return;
+      rules.push({ selector: lower, body: match[2], targetsAvatarElement, targetsWrapper });
+    });
+  }
+  return { rules, variables };
+}
+
+function inferThemeAvatarTag(theme) {
+  const { rules, variables } = getThemeAvatarRuleParts(theme);
+  if (!rules.length) return '';
+  let avatarVisibility = null;
+  let wrapperVisibility = null;
+  let bigScore = 0;
+  let smallScore = 0;
+
+  const updateVisibility = (rule, current) => {
+    const display = Array.from(rule.body.matchAll(/(?:^|;)\s*display\s*:\s*([^;]+)/gi)).at(-1)?.[1];
+    const visibility = Array.from(rule.body.matchAll(/(?:^|;)\s*visibility\s*:\s*([^;]+)/gi)).at(-1)?.[1];
+    const opacity = Array.from(rule.body.matchAll(/(?:^|;)\s*opacity\s*:\s*([^;]+)/gi)).at(-1)?.[1];
+    if (display) current = /^\s*none\b/i.test(display) ? false : true;
+    if (visibility) current = /^\s*(?:hidden|collapse)\b/i.test(visibility) ? false : true;
+    if (opacity && Number.parseFloat(opacity) === 0) current = false;
+    return current;
+  };
+
+  const scoreLength = (length, nestedInWrapper) => {
+    if (!length || !Number.isFinite(length.value) || length.value === 0) return;
+    const { value, unit } = length;
+    if (unit === 'px') {
+      if (value >= 140) bigScore += 3;
+      else if (value <= 110) smallScore += 2;
+      return;
+    }
+    if (unit === 'rem' || unit === 'em') {
+      if (value >= 9) bigScore += 3;
+      else if (value <= 7) smallScore += 2;
+      return;
+    }
+    if (['vw', 'vh', 'vmin', 'vmax', 'cqw', 'cqh'].includes(unit)) {
+      if (value >= 25) bigScore += 3;
+      else if (value <= 21) smallScore += 2;
+      return;
+    }
+    if (unit === '%' && !nestedInWrapper) {
+      if (value >= 45) bigScore += 3;
+      else if (value <= 25) smallScore += 1;
+    }
+  };
+
+  rules.forEach(rule => {
+    if (rule.targetsAvatarElement) avatarVisibility = updateVisibility(rule, avatarVisibility);
+    if (rule.targetsWrapper) wrapperVisibility = updateVisibility(rule, wrapperVisibility);
+    const nestedInWrapper = rule.selector.includes('mesavatarwrapper') && rule.targetsAvatarElement;
+    for (const match of rule.body.matchAll(/(?:^|;)\s*(?:width|height)\s*:\s*([^;]+)/gi)) {
+      if (rule.targetsAvatarElement) scoreLength(parseCssLength(match[1], variables), nestedInWrapper);
+      if (rule.targetsWrapper) {
+        const length = parseCssLength(match[1], variables);
+        if (length && ((length.unit === '%' && length.value <= 25)
+          || (['vw', 'vmin', 'cqw'].includes(length.unit) && length.value <= 22)
+          || (length.unit === 'px' && length.value <= 120))) smallScore += 1;
+      }
+    }
+  });
+
+  if (avatarVisibility === false || wrapperVisibility === false) return '无头像';
+  if (bigScore > smallScore && bigScore >= 3) return '大头像';
+  return '小头像';
+}
+
+function applyInferredThemeTags(record, theme) {
+  let changed = false;
+  if (!record.color.length && !record.autoColorDisabled) {
+    const colors = inferThemeColorTags(theme);
+    if (colors.length) {
+      record.color = colors;
+      changed = true;
+    }
+  }
+  if (!record.avatar.length && !record.autoAvatarDisabled) {
+    const avatar = inferThemeAvatarTag(theme);
+    if (avatar) {
+      record.avatar = [avatar];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function autoTagCurrentThemeMetadata() {
+  const name = getCurrentThemeName();
+  const record = getThemeRecord(name);
+  if (!record || !applyInferredThemeTags(record, getThemeObject(name))) return false;
+  saveSettings();
+  return true;
+}
+
+async function autoTagAllThemeMetadata() {
+  if (state.autoMetadataScanStarted) return;
+  state.autoMetadataScanStarted = true;
+  try {
+    const response = await fetch('/api/settings/get', {
+      method: 'POST',
+      headers: getRequestHeaders(),
+      body: JSON.stringify({}),
+      cache: 'no-cache',
+    });
+    if (!response.ok) throw new Error(`settings failed: ${response.status}`);
+    const data = await response.json();
+    let changed = 0;
+    (Array.isArray(data.themes) ? data.themes : []).forEach(theme => {
+      const themeName = normalizeTag(theme?.name);
+      const option = state.allThemeOptions.find(item => item.value === themeName || item.text === themeName);
+      const record = getThemeRecord(option?.value || themeName);
+      if (record && applyInferredThemeTags(record, theme)) changed += 1;
+    });
+    if (changed) {
+      saveSettings();
+      scheduleRefresh();
+    }
+  } catch (error) {
+    console.warn('TavernAssetClassifier: failed to auto-tag theme metadata', error);
+  }
 }
 
 function getTagPool(category) {
@@ -376,7 +960,6 @@ function applyBackgroundFile(filename) {
 }
 
 function applyBoundBackgroundForTheme(themeName = getCurrentThemeName()) {
-  if (!isBeautifyFeatureEnabled()) return false;
   const record = getThemeRecordForTheme(themeName);
   const background = normalizeTag(record?.background);
   if (!background) return false;
@@ -385,7 +968,6 @@ function applyBoundBackgroundForTheme(themeName = getCurrentThemeName()) {
 }
 
 function syncBoundBackgroundForCurrentTheme(force = false) {
-  if (!isBeautifyFeatureEnabled()) return;
   const themeName = normalizeTag(power_user.theme) || getCurrentThemeName();
   if (!themeName) return;
   if (!force && state.lastThemeBackgroundSyncName === themeName) return;
@@ -432,6 +1014,129 @@ function makeTag(category, tag, active = false, options = {}) {
   return button;
 }
 
+function requestDeleteTagConfirmation(category, tag) {
+  return new Promise(resolve => {
+    const existing = document.querySelector('#tac-binding-modal');
+    if (existing) closeModalOverlay(existing);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tac-binding-modal';
+    overlay.className = 'tac-binding-form-modal';
+    trapModalEvents(overlay);
+    overlay.innerHTML = `
+      <div class="tac-modal-card tac-rename-card">
+        <div class="tac-modal-head">
+          <div>
+            <div class="tac-modal-kicker">删除标签</div>
+            <div class="tac-modal-title">从全部美化中删除</div>
+          </div>
+          <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <div class="tac-confirm-body"></div>
+        <div class="tac-modal-actions">
+          <button type="button" class="menu_button" data-action="cancel">取消</button>
+          <button type="button" class="menu_button danger_button" data-action="confirm">删除</button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector('.tac-confirm-body').textContent = `确定删除“${CATEGORY_LABELS[category]}：${tag}”吗？全部使用这个标签的美化都会移除该标签。`;
+
+    const close = value => {
+      closeModalOverlay(overlay);
+      resolve(value);
+    };
+    overlay.addEventListener('click', event => {
+      if (event.target.closest('[data-action="cancel"]')) close(false);
+      if (event.target.closest('[data-action="confirm"]')) close(true);
+    });
+    mountModalOverlay(overlay);
+  });
+}
+
+function setAutomaticTaggingDisabled(record, category, disabled) {
+  if (category === 'color') record.autoColorDisabled = Boolean(disabled);
+  if (category === 'avatar') record.autoAvatarDisabled = Boolean(disabled);
+}
+
+function removeThemeTag(record, category, tag) {
+  record[category] = uniqueTags(record[category]).filter(item => item !== tag);
+  if ((category === 'color' || category === 'avatar') && !record[category].length) {
+    setAutomaticTaggingDisabled(record, category, true);
+  }
+}
+
+function deleteTagFromAllThemes(category, tag) {
+  const settings = getSettings(false);
+  let removed = 0;
+  Object.values(settings?.files ?? {}).forEach(record => {
+    if (!record || typeof record !== 'object') return;
+    const previous = uniqueTags(record[category]);
+    const next = previous.filter(item => item !== tag);
+    removed += previous.length - next.length;
+    record[category] = next;
+    if (next.length !== previous.length && (category === 'color' || category === 'avatar')) {
+      setAutomaticTaggingDisabled(record, category, true);
+    }
+  });
+  state.selectedFilters = state.selectedFilters.filter(filter => (
+    filter.category !== category || filter.tag !== tag
+  ));
+  saveSettings();
+  scheduleRefresh();
+  return removed;
+}
+
+async function confirmDeleteTagFromAllThemes(category, tag) {
+  if (!await requestDeleteTagConfirmation(category, tag)) return;
+  const removed = deleteTagFromAllThemes(category, tag);
+  notify(removed ? 'success' : 'info', removed
+    ? `已从 ${removed} 个美化中删除“${tag}”标签。`
+    : `没有美化正在使用“${tag}”标签。`);
+  if (document.querySelector('#tac-tag-modal')) openTagEditor();
+}
+
+function enableGlobalTagLongPress(chip, category, tag) {
+  let timer = null;
+  let startX = 0;
+  let startY = 0;
+  let suppressClick = false;
+  const cancel = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    chip.classList.remove('is-long-pressing');
+  };
+
+  chip.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    cancel();
+    startX = event.clientX;
+    startY = event.clientY;
+    chip.classList.add('is-long-pressing');
+    timer = setTimeout(() => {
+      timer = null;
+      suppressClick = true;
+      chip.classList.remove('is-long-pressing');
+      navigator.vibrate?.(20);
+      void confirmDeleteTagFromAllThemes(category, tag);
+    }, 650);
+  });
+  chip.addEventListener('pointermove', event => {
+    if (Math.hypot(event.clientX - startX, event.clientY - startY) > 12) cancel();
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(eventName => {
+    chip.addEventListener(eventName, cancel);
+  });
+  chip.addEventListener('contextmenu', event => event.preventDefault());
+  chip.addEventListener('click', event => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+}
+
 function makeFilterTag(category, tag, active = false) {
   const chip = makeTag(category, tag, active, { compactColor: category === 'color' });
   chip.title = active
@@ -455,12 +1160,17 @@ function scheduleRefresh(delay = 0) {
 
 function getFilteredThemeNames() {
   const names = getThemeNames();
-  if (!state.selectedFilters.length) return names;
+  const query = normalizeTag(state.themeSearchQuery).toLocaleLowerCase('zh-Hans-CN');
+  if (!state.selectedFilters.length && !query) return names;
 
   return names.filter(name => {
     const record = getThemeRecordForTheme(name);
-    if (!record) return false;
-    return state.selectedFilters.every(filter => uniqueTags(record[filter.category]).includes(filter.tag));
+    if (state.selectedFilters.length && !record) return false;
+    const matchesTags = state.selectedFilters.every(filter => uniqueTags(record?.[filter.category]).includes(filter.tag));
+    const searchable = [name, ...CATEGORIES.flatMap(category => uniqueTags(record?.[category]))]
+      .join(' ')
+      .toLocaleLowerCase('zh-Hans-CN');
+    return matchesTags && (!query || searchable.includes(query));
   });
 }
 
@@ -472,11 +1182,13 @@ function applyThemeFilterToSelect() {
 
   const previousValue = String(select.value || power_user.theme || '').trim();
   const visibleNames = new Set(getFilteredThemeNames());
-  let nextOptions = state.selectedFilters.length
-    ? state.allThemeOptions.filter(option => visibleNames.has(option.value))
-    : state.allThemeOptions;
-  const currentOption = state.allThemeOptions.find(option => option.value === previousValue);
-  if (state.selectedFilters.length && currentOption && !nextOptions.some(option => option.value === previousValue)) {
+  const orderedOptions = getOrderedThemeOptions();
+  const hasFilter = state.selectedFilters.length || normalizeTag(state.themeSearchQuery);
+  let nextOptions = hasFilter
+    ? orderedOptions.filter(option => visibleNames.has(option.value))
+    : orderedOptions;
+  const currentOption = orderedOptions.find(option => option.value === previousValue);
+  if (hasFilter && currentOption && !nextOptions.some(option => option.value === previousValue)) {
     nextOptions = [currentOption, ...nextOptions];
   }
   const currentValues = Array.from(select.options).map(option => option.value);
@@ -484,13 +1196,32 @@ function applyThemeFilterToSelect() {
   const isAlreadyTargetList = currentValues.length === nextValues.length
     && currentValues.every((value, index) => value === nextValues[index]);
 
-  if (isAlreadyTargetList) return;
+  if (isAlreadyTargetList) {
+    const labelUpdates = [];
+    Array.from(select.options).forEach(option => {
+      const source = orderedOptions.find(item => item.value === option.value);
+      if (!source) return;
+      const sourceName = source.text || source.value;
+      const label = sourceName;
+      if (option.dataset.tacThemeName !== sourceName || option.textContent !== label) {
+        labelUpdates.push({ option, sourceName, label });
+      }
+    });
+    if (!labelUpdates.length) return;
+    suppressThemeObserverUntilNextTask();
+    labelUpdates.forEach(({ option, sourceName, label }) => {
+      option.dataset.tacThemeName = sourceName;
+      option.textContent = label;
+    });
+    return;
+  }
 
-  state.suppressThemeObserver = true;
+  suppressThemeObserverUntilNextTask();
   select.innerHTML = '';
   nextOptions.forEach(item => {
     const option = document.createElement('option');
     option.value = item.value;
+    option.dataset.tacThemeName = item.text || item.value;
     option.textContent = item.text || item.value;
     select.append(option);
   });
@@ -503,7 +1234,6 @@ function applyThemeFilterToSelect() {
   } catch {
     // Select2 may not be attached.
   }
-  state.suppressThemeObserver = false;
 }
 
 function restoreThemeSelectOptions() {
@@ -511,10 +1241,12 @@ function restoreThemeSelectOptions() {
   if (!select) return;
   if (!state.allThemeOptions.length) snapshotThemeOptions();
   state.selectedFilters = [];
+  state.themeSearchQuery = '';
   applyThemeFilterToSelect();
 }
 
 function renderFilterPanel() {
+  sanitizeStoredThemeNameTags();
   pruneMissingThemeRecords();
   const panel = document.querySelector('#tac-filter-body');
   if (!panel) return;
@@ -531,6 +1263,31 @@ function renderFilterPanel() {
   });
 
   panel.innerHTML = '';
+  const search = document.createElement('div');
+  search.className = 'tac-theme-search';
+  search.innerHTML = `
+    <input type="search" class="text_pole tac-theme-search-input" placeholder="搜索美化名称或标签" autocomplete="off">
+    <button type="button" class="menu_button tac-theme-search-submit" title="查询"><i class="fa-solid fa-magnifying-glass"></i><span>查询</span></button>
+    <button type="button" class="menu_button tac-theme-search-clear" title="清空搜索"><i class="fa-solid fa-xmark"></i><span>清空</span></button>
+  `;
+  const searchInput = search.querySelector('.tac-theme-search-input');
+  searchInput.value = state.themeSearchQuery;
+  const submitSearch = () => {
+    state.themeSearchQuery = normalizeTag(searchInput.value);
+    renderFilterPanel();
+  };
+  search.querySelector('.tac-theme-search-submit').addEventListener('click', submitSearch);
+  search.querySelector('.tac-theme-search-clear').addEventListener('click', () => {
+    state.themeSearchQuery = '';
+    renderFilterPanel();
+  });
+  searchInput.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    submitSearch();
+  });
+  panel.append(search);
+
   const activeWrap = document.createElement('div');
   activeWrap.className = 'tac-active-filters';
   const activeHead = document.createElement('div');
@@ -609,6 +1366,7 @@ function renderFilterPanel() {
   panel.append(filterGrid);
 
   applyThemeFilterToSelect();
+  renderThemePicker();
 }
 
 function renderFilteredThemeList(panel) {
@@ -690,114 +1448,29 @@ function toggleFilter(category, tag) {
   renderFilterPanel();
 }
 
-function selectTheme(name) {
+function isUserSettingsDrawerOpen() {
+  return document.querySelector('#user-settings-block')?.classList.contains('openDrawer') ?? false;
+}
+
+function restoreUserSettingsDrawer() {
+  const drawer = document.querySelector('#user-settings-block');
+  if (!drawer) return;
+  drawer.classList.remove('closedDrawer');
+  drawer.classList.add('openDrawer');
+  const icon = drawer.parentElement?.querySelector(':scope > .drawer-toggle .drawer-icon');
+  icon?.classList.remove('closedIcon');
+  icon?.classList.add('openIcon');
+}
+
+function selectTheme(name, { preserveSettingsDrawer = isUserSettingsDrawerOpen() } = {}) {
   const select = getThemeSelect();
   if (!select) return;
   select.value = name;
   select.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-function getAutoTagsFromThemeName(name) {
-  const rawName = String(name ?? '');
-  if (!rawName.includes('_')) return { style: '', color: '' };
-  const parts = rawName.split('_').map(part => normalizeTag(part)).filter(Boolean);
-  const style = parts[0] || '';
-  const color = parts[1] && COLOR_TAGS.some(item => item.name === parts[1]) ? parts[1] : '';
-  return { style, color };
-}
-
-function getAutoDetectItems() {
-  return getThemeNames()
-    .map(name => ({ name, detected: getAutoTagsFromThemeName(name) }))
-    .filter(item => [item.detected.style, item.detected.color].filter(Boolean).length >= 2);
-}
-
-function requestAutoDetectConfirmation(items) {
-  return new Promise(resolve => {
-    const existing = document.querySelector('#tac-auto-modal');
-    if (existing) closeModalOverlay(existing);
-
-    const overlay = document.createElement('div');
-    overlay.id = 'tac-auto-modal';
-    document.body.classList.add('tac-modal-open');
-    trapModalEvents(overlay);
-    overlay.innerHTML = `
-      <div class="tac-modal-card tac-rename-card tac-binding-form-card">
-        <div class="tac-modal-head">
-          <div>
-            <div class="tac-modal-kicker">自动识别</div>
-            <div class="tac-modal-title"></div>
-          </div>
-          <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
-            <i class="fa-solid fa-xmark"></i>
-          </button>
-        </div>
-        <div class="tac-auto-body">
-          <div class="tac-auto-row"><span>数量</span><strong></strong></div>
-          <div class="tac-auto-row"><span>说明</span><strong></strong></div>
-        </div>
-        <div class="tac-modal-actions">
-          <button type="button" class="menu_button" data-action="cancel">取消</button>
-          <button type="button" class="menu_button" data-action="confirm">确定</button>
-        </div>
-      </div>
-    `;
-    overlay.querySelector('.tac-modal-title').textContent = '识别全部美化';
-    const values = overlay.querySelectorAll('.tac-auto-row strong');
-    values[0].textContent = `${items.length} 个`;
-    values[1].textContent = '将按名称中的下划线自动追加风格和颜色标签，不会清空已有标签。';
-
-    const close = value => {
-      closeModalOverlay(overlay);
-      resolve(value);
-    };
-
-    overlay.addEventListener('click', event => {
-      if (event.target.closest('[data-action="cancel"]')) close(false);
-      if (event.target.closest('[data-action="confirm"]')) close(true);
-    });
-
-    document.body.append(overlay);
-  });
-}
-
-async function autoDetectAllThemeTags() {
-  const items = getAutoDetectItems();
-  if (!items.length) {
-    notify('info', '当前没有可识别出两个有效标签的美化。');
-    return;
+  if (preserveSettingsDrawer) {
+    setTimeout(restoreUserSettingsDrawer, 0);
+    setTimeout(restoreUserSettingsDrawer, 80);
   }
-
-  const confirmed = await requestAutoDetectConfirmation(items);
-  if (!confirmed) return;
-
-  let changed = 0;
-  items.forEach(({ name, detected }) => {
-    const record = getThemeRecord(name);
-    if (!record) return;
-
-    const before = JSON.stringify({
-      style: uniqueTags(record.style),
-      color: uniqueTags(record.color),
-    });
-
-    if (detected.style) {
-      record.style = uniqueTags([...(record.style ?? []), detected.style]);
-    }
-    if (detected.color) {
-      record.color = uniqueTags([...(record.color ?? []), detected.color]).filter(tag => COLOR_TAGS.some(item => item.name === tag));
-    }
-
-    const after = JSON.stringify({
-      style: uniqueTags(record.style),
-      color: uniqueTags(record.color),
-    });
-    if (before !== after) changed += 1;
-  });
-
-  saveSettings();
-  renderFilterPanel();
-  notify('success', `已自动识别 ${items.length} 个美化，更新 ${changed} 个。`);
 }
 
 function openTagEditor() {
@@ -826,9 +1499,14 @@ function openTagEditor() {
           <div class="tac-modal-kicker">标签设置</div>
           <div class="tac-modal-title"></div>
         </div>
-        <button type="button" class="menu_button tac-icon-button" data-action="close" title="关闭">
-          <i class="fa-solid fa-xmark"></i>
-        </button>
+        <div class="tac-modal-head-actions">
+          <button type="button" class="menu_button tac-icon-button tac-favorite-button${record.favorite ? ' is-active' : ''}" data-action="favorite" title="收藏美化" aria-pressed="${record.favorite}">
+            <i class="fa-${record.favorite ? 'solid' : 'regular'} fa-star"></i>
+          </button>
+          <button type="button" class="menu_button tac-icon-button" data-action="close" title="关闭">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
       </div>
       <div class="tac-modal-selected"></div>
       <div class="tac-editor-groups"></div>
@@ -839,6 +1517,16 @@ function openTagEditor() {
   `;
   overlay.querySelector('.tac-modal-title').textContent = name;
   overlay.addEventListener('click', event => {
+    if (event.target.closest('[data-action="favorite"]')) {
+      record.favorite = !record.favorite;
+      saveSettings();
+      const favoriteButton = overlay.querySelector('.tac-favorite-button');
+      favoriteButton.classList.toggle('is-active', record.favorite);
+      favoriteButton.setAttribute('aria-pressed', String(record.favorite));
+      favoriteButton.querySelector('i').className = `fa-${record.favorite ? 'solid' : 'regular'} fa-star`;
+      renderFilterPanel();
+      return;
+    }
     if (event.target.closest('[data-action="close"]')) {
       closeModalOverlay(overlay);
       return;
@@ -859,9 +1547,10 @@ function openTagEditor() {
     for (const category of CATEGORIES) {
       uniqueTags(record[category]).forEach(tag => {
         const chip = makeTag(category, tag);
-        chip.title = '点击移除';
+        chip.title = '点击移除；长按可从全部美化中删除';
+        enableGlobalTagLongPress(chip, category, tag);
         chip.addEventListener('click', () => {
-          record[category] = uniqueTags(record[category]).filter(item => item !== tag);
+          removeThemeTag(record, category, tag);
           saveSettings();
           scheduleRefresh();
           refreshSelected();
@@ -887,7 +1576,7 @@ function openTagEditor() {
   }
   groups.append(createBackgroundBindingGroup(record));
 
-  document.body.append(overlay);
+  mountModalOverlay(overlay);
 }
 
 function createEditorGroup(category, record, refreshSelected) {
@@ -925,9 +1614,10 @@ function createEditorGroup(category, record, refreshSelected) {
     chips.innerHTML = '';
     uniqueTags(record[category]).forEach(tag => {
       const chip = makeTag(category, tag);
-      chip.title = '点击移除';
+      chip.title = '点击移除；长按可从全部美化中删除';
+      enableGlobalTagLongPress(chip, category, tag);
       chip.addEventListener('click', () => {
-        record[category] = uniqueTags(record[category]).filter(item => item !== tag);
+        removeThemeTag(record, category, tag);
         saveSettings();
         scheduleRefresh();
         refreshSelected?.();
@@ -941,6 +1631,10 @@ function createEditorGroup(category, record, refreshSelected) {
   const addTag = tag => {
     const normalized = normalizeTag(tag);
     if (!normalized) return;
+    if ((category === 'style' || category === 'topic') && isThemeNameTag(normalized)) {
+      notify('info', '美化名称不能作为标签。');
+      return;
+    }
     record[category] = uniqueTags([...(record[category] ?? []), normalized]);
     saveSettings();
     scheduleRefresh();
@@ -955,7 +1649,8 @@ function createEditorGroup(category, record, refreshSelected) {
       .filter(tag => !uniqueTags(record[category]).includes(tag))
       .forEach(tag => {
         const chip = makeTag(category, tag);
-        chip.title = '点击添加到当前主题';
+        chip.title = '点击添加到当前美化；长按可从全部美化中删除';
+        enableGlobalTagLongPress(chip, category, tag);
         chip.addEventListener('click', () => addTag(tag));
         suggestionsTags.append(chip);
       });
@@ -991,11 +1686,15 @@ function createEditorGroup(category, record, refreshSelected) {
       palette.innerHTML = '';
       COLOR_TAGS.forEach(item => {
         const button = makeTag('color', item.name, uniqueTags(record.color).includes(item.name));
+        button.title = '点击切换；长按可从全部美化中移除这个颜色标签';
+        enableGlobalTagLongPress(button, 'color', item.name);
         button.addEventListener('click', () => {
           if (uniqueTags(record.color).includes(item.name)) {
             record.color = uniqueTags(record.color).filter(tag => tag !== item.name);
+            setAutomaticTaggingDisabled(record, 'color', !record.color.length);
           } else {
             record.color = uniqueTags([...(record.color ?? []), item.name]);
+            setAutomaticTaggingDisabled(record, 'color', false);
           }
           saveSettings();
           scheduleRefresh();
@@ -1015,8 +1714,12 @@ function createEditorGroup(category, record, refreshSelected) {
       palette.innerHTML = '';
       AVATAR_TAGS.forEach(name => {
         const button = makeTag('avatar', name, uniqueTags(record.avatar).includes(name));
+        button.title = '点击切换；长按可从全部美化中移除这个头像标签';
+        enableGlobalTagLongPress(button, 'avatar', name);
         button.addEventListener('click', () => {
-          record.avatar = uniqueTags(record.avatar).includes(name) ? [] : [name];
+          const removing = uniqueTags(record.avatar).includes(name);
+          record.avatar = removing ? [] : [name];
+          setAutomaticTaggingDisabled(record, 'avatar', removing);
           saveSettings();
           scheduleRefresh();
           refreshSelected?.();
@@ -1168,7 +1871,7 @@ function requestThemeName(oldName) {
       if (event.key === 'Escape') close('');
     });
 
-  document.body.append(overlay);
+  mountModalOverlay(overlay);
 });
 }
 
@@ -1216,6 +1919,7 @@ async function renameCurrentTheme() {
         ? globalThis.structuredClone(settings.files[oldName])
         : JSON.parse(JSON.stringify(settings.files[oldName]));
     }
+    sanitizeStoredThemeNameTags();
     power_user.theme = nextName;
     saveSettings();
     applyThemeFilterToSelect();
@@ -1237,29 +1941,6 @@ async function renameCurrentTheme() {
   }
 }
 
-function getPromptList() {
-  return document.querySelector('#completion_prompt_manager_list, #openai_prompt_manager_list, [id$="prompt_manager_list"], ul[id*="prompt_manager"]');
-}
-
-function getPromptItems(list = getPromptList()) {
-  if (!list) return [];
-  return Array.from(list.querySelectorAll('li[data-pm-identifier]'));
-}
-
-function getPromptIdentifier(item) {
-  return String(item?.dataset?.pmIdentifier || '').trim();
-}
-
-function getPromptTitle(item) {
-  const nameNode = item?.querySelector('[data-pm-name]');
-  const rawName = nameNode?.dataset?.pmName || nameNode?.textContent || item?.textContent || '';
-  return String(rawName).replace(/\s+/g, ' ').trim();
-}
-
-function makePresetEntryGroupId() {
-  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
-  return `tac-group-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
-}
 
 function getCurrentPromptPresetName() {
   const select = getCurrentPromptPresetSelect();
@@ -1280,32 +1961,6 @@ function getPresetBindingDisplayName(binding) {
   return normalizeTag(binding?.presetName || binding?.presetValue || '未知');
 }
 
-function getPresetEntryGroupKey() {
-  const list = getPromptList();
-  const listId = String(list?.id || 'prompt_manager_list').trim();
-  const presetName = getCurrentPromptPresetName();
-  return `${listId}:${presetName || 'default'}`;
-}
-
-function getPresetEntryStore() {
-  const settings = getSettings();
-  if (!settings) return { groups: [] };
-  const key = getPresetEntryGroupKey();
-  if (!settings.presetEntryGroups[key] || typeof settings.presetEntryGroups[key] !== 'object') {
-    settings.presetEntryGroups[key] = { groups: [] };
-  }
-  const store = settings.presetEntryGroups[key];
-  if (!Array.isArray(store.groups)) store.groups = [];
-  store.groups = store.groups
-    .filter(group => group && typeof group === 'object' && Array.isArray(group.memberIdentifiers))
-    .map(group => ({
-      id: String(group.id || makePresetEntryGroupId()),
-      name: String(group.name || '分类'),
-      collapsed: Boolean(group.collapsed),
-      memberIdentifiers: [...new Set(group.memberIdentifiers.map(value => String(value || '').trim()).filter(Boolean))],
-    }));
-  return store;
-}
 
 function getCurrentPromptOrderSnapshot() {
   const manager = promptManager;
@@ -1322,8 +1977,6 @@ function capturePresetBinding(name) {
     presetName: getCurrentPromptPresetName(),
     presetValue: getCurrentPromptPresetValue(),
     promptOrder: getCurrentPromptOrderSnapshot(),
-    presetEntryKey: getPresetEntryGroupKey(),
-    presetEntryStore: cloneData(getPresetEntryStore()),
   };
 }
 
@@ -1334,6 +1987,52 @@ function captureUserBinding(name) {
     createdAt: new Date().toISOString(),
     avatar: normalizeTag(user_avatar),
     userName: normalizeTag(name1),
+  };
+}
+
+function getCurrentCharacterWorldBookSelection() {
+  const { id, character } = getCurrentCharacterContext();
+  const fileName = character ? getCharaFilename(id) : '';
+  const extra = world_info?.charLore?.find(item => item?.name === fileName);
+  return {
+    fileName: normalizeTag(fileName),
+    primary: normalizeTag(character?.data?.extensions?.world),
+    additional: uniqueTags(extra?.extraBooks),
+  };
+}
+
+function getWorldBookBindingSummary(binding) {
+  const books = Array.isArray(binding?.books) ? binding.books : [];
+  const entryCount = books.reduce((total, book) => total + Object.keys(book?.data?.entries ?? {}).length, 0);
+  const globalCount = uniqueTags(binding?.globalBooks).length;
+  const characterCount = uniqueTags([
+    binding?.characterBooks?.primary,
+    ...(binding?.characterBooks?.additional ?? []),
+  ]).length;
+  return `全局 ${globalCount} 本 · 角色 ${characterCount} 本 · ${entryCount} 条目`;
+}
+
+async function captureWorldBookBinding(name) {
+  const globalBooks = uniqueTags(selected_world_info);
+  const characterSelection = getCurrentCharacterWorldBookSelection();
+  const characterBooks = {
+    primary: characterSelection.primary,
+    additional: characterSelection.additional,
+  };
+  const bookNames = uniqueTags([globalBooks, characterBooks.primary, characterBooks.additional].flat());
+  const books = [];
+  for (const bookName of bookNames) {
+    const data = await loadWorldInfo(bookName);
+    if (!data) throw new Error(`failed to load world book: ${bookName}`);
+    books.push({ name: bookName, data: cloneData(data) });
+  }
+  return {
+    id: makeBindingId(),
+    name,
+    createdAt: new Date().toISOString(),
+    globalBooks,
+    characterBooks,
+    books,
   };
 }
 
@@ -1385,7 +2084,7 @@ async function requestBindingName(title, defaultValue) {
       if (event.key === 'Escape') close('');
     });
 
-    document.body.append(overlay);
+    mountModalOverlay(overlay);
     const isMobileViewport = window.matchMedia?.('(max-width: 700px)')?.matches || navigator.maxTouchPoints > 0;
     if (!isMobileViewport) {
       setTimeout(() => input.focus(), 0);
@@ -1403,7 +2102,6 @@ async function savePresetBinding() {
   if (!name) return;
   const bindings = getCurrentCharacterBindings();
   bindings.presets.items.unshift(capturePresetBinding(name));
-  if (!bindings.presets.starredId) bindings.presets.starredId = bindings.presets.items[0].id;
   if (await saveCurrentCharacterBindings(bindings)) notify('success', '预设绑定已保存到当前角色卡。');
 }
 
@@ -1412,8 +2110,30 @@ async function saveUserBinding() {
   if (!name) return;
   const bindings = getCurrentCharacterBindings();
   bindings.users.items.unshift(captureUserBinding(name));
-  if (!bindings.users.starredId) bindings.users.starredId = bindings.users.items[0].id;
   if (await saveCurrentCharacterBindings(bindings)) notify('success', 'user 绑定已保存到当前角色卡。');
+}
+
+async function saveWorldBookBinding() {
+  const characterSelection = getCurrentCharacterWorldBookSelection();
+  const currentNames = uniqueTags([
+    ...selected_world_info,
+    characterSelection.primary,
+    ...characterSelection.additional,
+  ]);
+  const defaultName = currentNames.length ? currentNames.join(' + ') : '无世界书';
+  const name = await requestBindingName('世界书绑定名称', defaultName);
+  if (!name) return;
+  try {
+    const snapshot = await captureWorldBookBinding(name);
+    const bindings = getCurrentCharacterBindings();
+    bindings.worldBooks.items.unshift(snapshot);
+    if (await saveCurrentCharacterBindings(bindings)) {
+      notify('success', `世界书绑定已保存：${getWorldBookBindingSummary(snapshot)}`);
+    }
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to capture world books', error);
+    notify('error', '读取世界书条目失败，未保存绑定。');
+  }
 }
 
 async function saveBeautifyBinding(themeName = getCurrentThemeName()) {
@@ -1487,7 +2207,139 @@ function openBeautifyBindingPicker() {
   overlay.addEventListener('click', event => {
     if (event.target.closest('[data-action="cancel"]')) closeModalOverlay(overlay);
   });
-  document.body.append(overlay);
+  mountModalOverlay(overlay);
+}
+
+function requestCharacterRelationConfirmation(title, message, confirmLabel) {
+  return new Promise(resolve => {
+    const existing = document.querySelector('#tac-binding-modal');
+    if (existing) closeModalOverlay(existing);
+    const overlay = document.createElement('div');
+    overlay.id = 'tac-binding-modal';
+    overlay.className = 'tac-binding-form-modal';
+    trapModalEvents(overlay);
+    overlay.innerHTML = `
+      <div class="tac-modal-card tac-rename-card">
+        <div class="tac-modal-head">
+          <div>
+            <div class="tac-modal-kicker">角色卡关联</div>
+            <div class="tac-modal-title"></div>
+          </div>
+          <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="tac-confirm-body"></div>
+        <div class="tac-modal-actions">
+          <button type="button" class="menu_button" data-action="cancel">取消</button>
+          <button type="button" class="menu_button" data-action="confirm"></button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector('.tac-modal-title').textContent = title;
+    overlay.querySelector('.tac-confirm-body').textContent = message;
+    overlay.querySelector('[data-action="confirm"]').textContent = confirmLabel;
+    const close = value => {
+      closeModalOverlay(overlay);
+      resolve(value);
+    };
+    overlay.addEventListener('click', event => {
+      if (event.target.closest('[data-action="cancel"]')) close(false);
+      if (event.target.closest('[data-action="confirm"]')) close(true);
+    });
+    mountModalOverlay(overlay);
+  });
+}
+
+async function switchToRelatedCharacter(avatar, fallbackName = '') {
+  const target = findCharacterByAvatar(avatar);
+  if (!target) {
+    notify('warning', `找不到角色卡：${fallbackName || avatar}`);
+    return;
+  }
+  const confirmed = await requestCharacterRelationConfirmation(
+    '切换角色卡',
+    `确定转到“${target.name}”的角色卡界面吗？`,
+    '确认前往',
+  );
+  if (!confirmed) return;
+  const latest = findCharacterByAvatar(avatar);
+  if (latest) await selectCharacterById(latest.id);
+}
+
+async function confirmRemoveRelatedCharacter(avatar, fallbackName = '') {
+  const target = findCharacterByAvatar(avatar);
+  const name = target?.name || fallbackName || avatar;
+  const confirmed = await requestCharacterRelationConfirmation(
+    '删除角色卡关联',
+    `确定将“${name}”移出当前关联集合吗？剩余角色卡仍会保持互联。`,
+    '确认删除',
+  );
+  if (confirmed) await removeCharacterFromRelationGroup(avatar);
+}
+
+function openCharacterLibraryPicker() {
+  const { character } = getCurrentCharacterContext();
+  const currentAvatar = normalizeTag(character?.avatar);
+  const linked = new Set(getCurrentCharacterBindings().relatedCharacters.map(item => item.avatar));
+  const candidates = getCharacterLibrary()
+    .filter(item => item.avatar !== currentAvatar && !linked.has(item.avatar))
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+  if (!candidates.length) {
+    notify('info', '角色卡库中没有可添加的角色卡。');
+    return;
+  }
+
+  const existing = document.querySelector('#tac-binding-modal');
+  if (existing) closeModalOverlay(existing);
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-binding-modal';
+  overlay.className = 'tac-character-library-modal';
+  trapModalEvents(overlay);
+  overlay.innerHTML = `
+    <div class="tac-modal-card tac-character-library-card">
+      <div class="tac-modal-head">
+        <div>
+          <div class="tac-modal-kicker">角色卡关联</div>
+          <div class="tac-modal-title">从角色卡库添加</div>
+        </div>
+        <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <div class="tac-character-library-search">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <input type="search" class="text_pole" placeholder="搜索角色名称" autocomplete="off">
+      </div>
+      <div class="tac-character-library-grid"></div>
+      <div class="tac-character-library-empty" hidden>没有匹配的角色卡。</div>
+    </div>
+  `;
+  const grid = overlay.querySelector('.tac-character-library-grid');
+  const empty = overlay.querySelector('.tac-character-library-empty');
+  candidates.forEach(candidate => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tac-character-library-item';
+    button.dataset.searchText = `${candidate.name} ${candidate.avatar}`.toLocaleLowerCase('zh-Hans-CN');
+    button.innerHTML = '<img alt=""><span></span>';
+    button.querySelector('img').src = getThumbnailUrl('avatar', candidate.avatar);
+    button.querySelector('img').alt = candidate.name;
+    button.querySelector('span').textContent = candidate.name;
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      if (await addCharacterToRelationGroup(candidate.avatar)) closeModalOverlay(overlay);
+      else button.disabled = false;
+    });
+    grid.append(button);
+  });
+  const searchInput = overlay.querySelector('input');
+  searchInput.addEventListener('input', () => {
+    const query = normalizeTag(searchInput.value).toLocaleLowerCase('zh-Hans-CN');
+    const items = Array.from(grid.children);
+    items.forEach(item => item.hidden = Boolean(query) && !item.dataset.searchText.includes(query));
+    empty.hidden = items.some(item => !item.hidden);
+  });
+  overlay.addEventListener('click', event => {
+    if (event.target.closest('[data-action="cancel"]')) closeModalOverlay(overlay);
+  });
+  mountModalOverlay(overlay);
 }
 
 async function applyPresetBinding(binding, { automatic = false } = {}) {
@@ -1498,7 +2350,13 @@ async function applyPresetBinding(binding, { automatic = false } = {}) {
       || (binding.presetName && normalizeTag(option.textContent) === binding.presetName)
       || (binding.presetName && option.value === binding.presetName)
   )) : null;
-  if (matchedOption) {
+  const presetNeedsChange = Boolean(matchedOption && select?.value !== matchedOption.value);
+  const promptOrderNeedsChange = Boolean(
+    Array.isArray(binding.promptOrder)
+      && binding.promptOrder.length
+      && !dataMatches(getCurrentPromptOrderSnapshot(), binding.promptOrder),
+  );
+  if (presetNeedsChange) {
     select.value = matchedOption.value;
     const jquery = window.jQuery || window.$;
     if (jquery) {
@@ -1507,41 +2365,39 @@ async function applyPresetBinding(binding, { automatic = false } = {}) {
       select.dispatchEvent(new Event('change', { bubbles: true }));
     }
     await new Promise(resolve => setTimeout(resolve, 350));
-  } else if ((binding.presetName || binding.presetValue) && !automatic) {
+  } else if (!matchedOption && (binding.presetName || binding.presetValue) && !automatic) {
     notify('warning', `找不到预设：${getPresetBindingDisplayName(binding)}`);
   }
 
   const manager = promptManager;
   const character = manager?.activeCharacter;
-  if (character && Array.isArray(binding.promptOrder) && binding.promptOrder.length && manager?.removePromptOrderForCharacter && manager?.addPromptOrderForCharacter) {
+  if (promptOrderNeedsChange && character && manager?.removePromptOrderForCharacter && manager?.addPromptOrderForCharacter) {
     manager.removePromptOrderForCharacter(character);
     manager.addPromptOrderForCharacter(character, cloneData(binding.promptOrder));
     manager.saveServiceSettings?.();
     manager.render?.(false);
   }
 
-  if (binding.presetEntryStore && typeof binding.presetEntryStore === 'object') {
-    const settings = getSettings();
-    settings.presetEntryGroups[getPresetEntryGroupKey()] = cloneData(binding.presetEntryStore);
-    saveSettings();
-    schedulePresetEntryRender(0);
-  }
-  if (!automatic) notify('success', `已应用预设绑定：${binding.name}`);
-  return true;
+  const changed = presetNeedsChange || promptOrderNeedsChange;
+  if (!automatic) notify('success', changed ? `已应用预设绑定：${binding.name}` : '当前预设和条目顺序已经一致。');
+  return changed;
 }
 
 async function applyUserBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
-  if (binding.avatar && power_user.personas?.[binding.avatar]) {
+  const avatarNeedsChange = Boolean(binding.avatar && binding.avatar !== normalizeTag(user_avatar));
+  const nameNeedsChange = Boolean(binding.userName && binding.userName !== normalizeTag(name1));
+  if (avatarNeedsChange && power_user.personas?.[binding.avatar]) {
     await setUserAvatar(binding.avatar, { toastPersonaNameChange: !automatic, navigateToCurrent: false });
-  } else if (binding.avatar && !automatic) {
+  } else if (avatarNeedsChange && !automatic) {
     notify('warning', `找不到 user 头像：${binding.avatar}`);
   }
-  if (binding.userName) {
+  if (nameNeedsChange) {
     setUserName(binding.userName, { toastPersonaNameChange: !automatic });
   }
-  if (!automatic) notify('success', `已应用 user 绑定：${binding.name}`);
-  return true;
+  const changed = (avatarNeedsChange && Boolean(power_user.personas?.[binding.avatar])) || nameNeedsChange;
+  if (!automatic) notify('success', changed ? `已应用 user 绑定：${binding.name}` : '当前 user 已与绑定一致。');
+  return changed;
 }
 
 function applyBeautifyBinding(themeName, { automatic = false } = {}) {
@@ -1551,9 +2407,55 @@ function applyBeautifyBinding(themeName, { automatic = false } = {}) {
     if (!automatic) notify('warning', `找不到美化：${normalized}`);
     return false;
   }
+  if (normalizeTag(power_user.theme || getCurrentThemeName()) === normalized) {
+    if (!automatic) notify('success', '当前美化已与绑定一致。');
+    return false;
+  }
   selectTheme(normalized);
   if (!automatic) notify('success', `已应用角色卡美化：${normalized}`);
   return true;
+}
+
+async function applyWorldBookBinding(binding, { automatic = false } = {}) {
+  if (!binding) return false;
+  const books = Array.isArray(binding.books) ? binding.books : [];
+  const targetGlobalBooks = uniqueTags(binding.globalBooks ?? books.map(book => book.name));
+  const targetPrimary = normalizeTag(binding.characterBooks?.primary);
+  const targetAdditional = uniqueTags(binding.characterBooks?.additional);
+  let contentChanged = false;
+
+  try {
+    for (const book of books) {
+      const current = await loadWorldInfo(book.name);
+      if (dataMatches(current, book.data)) continue;
+      await saveWorldInfo(book.name, cloneData(book.data), true);
+      contentChanged = true;
+    }
+
+    const globalSelectionChanged = !stringSetsMatch(selected_world_info, targetGlobalBooks);
+    if (globalSelectionChanged) {
+      updateWorldInfoSettings(cloneData(getWorldInfoSettings()), targetGlobalBooks);
+    }
+    if (contentChanged || globalSelectionChanged) {
+      await updateWorldInfoList();
+    }
+
+    const { id, character } = getCurrentCharacterContext();
+    const currentCharacterBooks = getCurrentCharacterWorldBookSelection();
+    const primaryChanged = Boolean(character) && currentCharacterBooks.primary !== targetPrimary;
+    const additionalChanged = Boolean(character)
+      && !stringSetsMatch(currentCharacterBooks.additional, targetAdditional);
+    if (primaryChanged) await writeExtensionField(id, 'world', targetPrimary);
+    if (additionalChanged) charSetAuxWorlds(currentCharacterBooks.fileName, targetAdditional);
+
+    const changed = contentChanged || globalSelectionChanged || primaryChanged || additionalChanged;
+    if (!automatic) notify('success', changed ? `已应用世界书绑定：${binding.name}` : '当前世界书及条目已经一致。');
+    return changed;
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to apply world books', error);
+    if (!automatic) notify('error', '应用世界书绑定失败，请检查控制台。');
+    return false;
+  }
 }
 
 async function deleteCharacterBinding(type, id) {
@@ -1564,7 +2466,7 @@ async function deleteCharacterBinding(type, id) {
   const confirmed = await requestDeleteBindingConfirmation(type, item?.name || '');
   if (!confirmed) return;
   bucket.items = bucket.items.filter(item => item.id !== id);
-  if (bucket.starredId === id) bucket.starredId = bucket.items[0]?.id || '';
+  if (bucket.starredId === id) bucket.starredId = '';
   await saveCurrentCharacterBindings(bindings);
 }
 
@@ -1596,7 +2498,8 @@ function requestDeleteBindingConfirmation(type, name) {
         </div>
       </div>
     `;
-    overlay.querySelector('.tac-modal-title').textContent = type === 'presets' ? '删除预设绑定' : '删除 user 绑定';
+    const titles = { presets: '删除预设绑定', users: '删除 user 绑定', worldBooks: '删除世界书绑定' };
+    overlay.querySelector('.tac-modal-title').textContent = titles[type] || '删除绑定';
     overlay.querySelector('.tac-confirm-body').textContent = name ? `确定删除“${name}”？` : '确定删除这条绑定？';
 
     const close = value => {
@@ -1608,8 +2511,104 @@ function requestDeleteBindingConfirmation(type, name) {
       if (event.target.closest('[data-action="cancel"]')) close(false);
       if (event.target.closest('[data-action="confirm"]')) close(true);
     });
-    document.body.append(overlay);
+    mountModalOverlay(overlay);
   });
+}
+
+function requestUpdateBindingConfirmation(title, message) {
+  return new Promise(resolve => {
+    const existing = document.querySelector('#tac-binding-modal');
+    if (existing) closeModalOverlay(existing);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tac-binding-modal';
+    overlay.className = 'tac-binding-form-modal';
+    document.body.classList.add('tac-modal-open');
+    trapModalEvents(overlay);
+    overlay.innerHTML = `
+      <div class="tac-modal-card tac-rename-card">
+        <div class="tac-modal-head">
+          <div>
+            <div class="tac-modal-kicker">更新绑定</div>
+            <div class="tac-modal-title"></div>
+          </div>
+          <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <div class="tac-confirm-body"></div>
+        <div class="tac-modal-actions">
+          <button type="button" class="menu_button" data-action="cancel">取消</button>
+          <button type="button" class="menu_button" data-action="confirm">确认更新</button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector('.tac-modal-title').textContent = title;
+    overlay.querySelector('.tac-confirm-body').textContent = message;
+
+    const close = value => {
+      closeModalOverlay(overlay);
+      resolve(value);
+    };
+    overlay.addEventListener('click', event => {
+      if (event.target.closest('[data-action="cancel"]')) close(false);
+      if (event.target.closest('[data-action="confirm"]')) close(true);
+    });
+    mountModalOverlay(overlay);
+  });
+}
+
+async function updatePresetBinding(id) {
+  const presetName = getCurrentPromptPresetName();
+  if (!presetName) {
+    notify('info', '当前没有可用于更新的预设。');
+    return;
+  }
+  const bindings = getCurrentCharacterBindings();
+  const item = bindings.presets.items.find(binding => binding.id === id);
+  if (!item) return;
+  if (!await requestUpdateBindingConfirmation('更新预设绑定', `将“${item.name}”更新为当前预设“${presetName}”，是否继续？`)) return;
+
+  const snapshot = capturePresetBinding(item.name);
+  Object.assign(item, snapshot, {
+    id: item.id,
+    name: item.name,
+    createdAt: item.createdAt || snapshot.createdAt,
+    updatedAt: new Date().toISOString(),
+  });
+  if (await saveCurrentCharacterBindings(bindings)) {
+    notify('success', `已用当前预设更新绑定：${item.name}`);
+  }
+}
+
+async function updateWorldBookBinding(id) {
+  const bindings = getCurrentCharacterBindings();
+  const item = bindings.worldBooks.items.find(binding => binding.id === id);
+  if (!item) return;
+  const characterSelection = getCurrentCharacterWorldBookSelection();
+  const currentNames = uniqueTags([
+    ...selected_world_info,
+    characterSelection.primary,
+    ...characterSelection.additional,
+  ]);
+  const description = currentNames.length ? currentNames.join('、') : '无世界书';
+  if (!await requestUpdateBindingConfirmation('更新世界书绑定', `将“${item.name}”更新为当前启用及角色挂载的世界书（${description}）和全部条目，是否继续？`)) return;
+
+  try {
+    const snapshot = await captureWorldBookBinding(item.name);
+    Object.assign(item, snapshot, {
+      id: item.id,
+      name: item.name,
+      createdAt: item.createdAt || snapshot.createdAt,
+      updatedAt: new Date().toISOString(),
+    });
+    if (await saveCurrentCharacterBindings(bindings)) {
+      notify('success', `已更新世界书绑定：${getWorldBookBindingSummary(item)}`);
+    }
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to update world books', error);
+    notify('error', '读取世界书条目失败，未更新绑定。');
+  }
 }
 
 async function starCharacterBinding(type, id) {
@@ -1636,6 +2635,8 @@ async function applyStarredCharacterBindings() {
     if (preset) await applyPresetBinding(preset, { automatic: true });
     const user = bindings.users.items.find(item => item.id === bindings.users.starredId);
     if (user) await applyUserBinding(user, { automatic: true });
+    const worldBooks = bindings.worldBooks.items.find(item => item.id === bindings.worldBooks.starredId);
+    if (worldBooks) await applyWorldBookBinding(worldBooks, { automatic: true });
   } finally {
     state.applyingCharacterBinding = false;
     scheduleCharacterBindingRender();
@@ -1658,589 +2659,114 @@ function scheduleCharacterBindingRender(delay = 80) {
   }, delay);
 }
 
-function cleanupPresetEntryGrouping(list = getPromptList()) {
-  if (!list) return;
-  list.querySelectorAll('.tac-preset-group-header').forEach(node => node.remove());
-  list.querySelectorAll('.tac-preset-group-end').forEach(node => node.remove());
-  Array.from(list.querySelectorAll('.tac-preset-group-wrapper')).forEach(wrapper => {
-    const parent = wrapper.parentNode;
-    if (!parent) return;
-    Array.from(wrapper.children).forEach(child => parent.insertBefore(child, wrapper));
-    wrapper.remove();
-  });
-  getPromptItems(list).forEach(item => {
-    item.classList.remove('tac-preset-select-start', 'tac-preset-select-range', 'tac-preset-group-collapsed-item');
-    delete item.dataset.tacPresetGroupId;
-  });
-}
 
-function injectPresetEntryButtons(list = getPromptList()) {
-  getPromptItems(list).forEach(item => {
-    const controls = item.querySelector('.prompt_manager_prompt_controls');
-    if (!controls || controls.querySelector('.tac-preset-classify-button')) return;
-    const button = document.createElement('span');
-    button.className = 'tac-preset-classify-button menu_button fa-solid fa-tags';
-    button.role = 'button';
-    button.tabIndex = 0;
-    button.title = '分类';
-    button.addEventListener('click', event => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (state.presetEntrySelection?.startIdentifier) {
-        createPresetEntryGroup(item);
-      } else {
-        beginPresetEntrySelection(item);
+
+
+function waitForThemeImportInputReset(input, timeout = 300000) {
+  return new Promise(resolve => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (!input.files?.length || Date.now() - startedAt >= timeout) {
+        clearInterval(timer);
+        resolve(!input.files?.length);
       }
-    });
-    button.addEventListener('keydown', event => {
-      if (event.key !== 'Enter' && event.key !== ' ') return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (state.presetEntrySelection?.startIdentifier) {
-        createPresetEntryGroup(item);
-      } else {
-        beginPresetEntrySelection(item);
-      }
-    });
-    controls.insertBefore(button, controls.firstChild);
+    }, 50);
   });
 }
 
-function renderPresetEntrySelection() {
-  const list = getPromptList();
-  const selection = state.presetEntrySelection;
-  getPromptItems(list).forEach(item => {
-    item.classList.toggle('tac-preset-select-start', selection?.startIdentifier === getPromptIdentifier(item));
-    item.classList.remove('tac-preset-select-range');
-  });
-}
-
-function beginPresetEntrySelection(item) {
-  const identifier = getPromptIdentifier(item);
-  if (!identifier) return;
-  state.presetEntrySelection = { startIdentifier: identifier };
-  renderPresetEntrySelection();
-  notify('info', '请选择同一段分类的结束条目。');
-}
-
-function makePresetEntryHeader(group, count) {
-  const header = document.createElement('div');
-  header.className = 'tac-preset-group-header';
-  header.dataset.groupId = group.id;
-  header.innerHTML = `
-    <button type="button" class="tac-preset-group-toggle menu_button" title="${group.collapsed ? '展开分类' : '折叠分类'}">
-      <i class="fa-solid ${group.collapsed ? 'fa-chevron-right' : 'fa-chevron-down'}"></i>
-    </button>
-    <button type="button" class="tac-preset-group-name" title="折叠/展开">${escapeHtml(group.name)}</button>
-    <span class="tac-preset-group-count">${count}</span>
-    <button type="button" class="tac-preset-group-rename menu_button" title="重命名分类"><i class="fa-solid fa-pen"></i></button>
-    <button type="button" class="tac-preset-group-dissolve menu_button" title="解散分类"><i class="fa-solid fa-link-slash"></i></button>
-  `;
-  header.querySelector('.tac-preset-group-toggle')?.addEventListener('click', event => {
-    event.preventDefault();
-    event.stopPropagation();
-    togglePresetEntryGroup(group.id);
-  });
-  header.querySelector('.tac-preset-group-name')?.addEventListener('click', event => {
-    event.preventDefault();
-    event.stopPropagation();
-    togglePresetEntryGroup(group.id);
-  });
-  header.querySelector('.tac-preset-group-rename')?.addEventListener('click', event => {
-    event.preventDefault();
-    event.stopPropagation();
-    renamePresetEntryGroup(group.id);
-  });
-  header.querySelector('.tac-preset-group-dissolve')?.addEventListener('click', event => {
-    event.preventDefault();
-    event.stopPropagation();
-    dissolvePresetEntryGroup(group.id);
-  });
-  return header;
-}
-
-function makePresetEntryEnd(group) {
-  const end = document.createElement('div');
-  end.className = 'tac-preset-group-end';
-  end.dataset.groupId = group.id;
-  end.innerHTML = '<span></span>';
-  return end;
-}
-
-function applyPresetEntryGroups() {
-  const list = getPromptList();
-  if (!list) return false;
-  state.applyingPresetEntryGroups = true;
-  cleanupPresetEntryGrouping(list);
-  injectPresetEntryButtons(list);
-
-  const store = getPresetEntryStore();
-  const items = getPromptItems(list);
-  const itemsById = new Map(items.map(item => [getPromptIdentifier(item), item]));
-  const claimed = new Set();
-
-  store.groups.forEach(group => {
-    const memberItems = group.memberIdentifiers
-      .map(identifier => itemsById.get(identifier))
-      .filter(item => item && !claimed.has(getPromptIdentifier(item)));
-    if (!memberItems.length) return;
-    memberItems.forEach(item => claimed.add(getPromptIdentifier(item)));
-    const first = memberItems[0];
-    const header = makePresetEntryHeader(group, memberItems.length);
-    first.parentNode.insertBefore(header, first);
-    memberItems.forEach(item => {
-      item.dataset.tacPresetGroupId = group.id;
-      item.classList.toggle('tac-preset-group-collapsed-item', group.collapsed);
-    });
-    if (!group.collapsed) {
-      const last = memberItems[memberItems.length - 1];
-      last.parentNode.insertBefore(makePresetEntryEnd(group), last.nextSibling);
-    }
-  });
-
-  renderPresetEntrySelection();
-  setTimeout(() => {
-    state.applyingPresetEntryGroups = false;
-  }, 0);
-  return true;
-}
-
-function syncPresetEntryGroupsFromDom() {
-  if (state.applyingPresetEntryGroups) return;
-  const list = getPromptList();
-  if (!list) return;
-  const store = getPresetEntryStore();
-  let changed = false;
-  const identifiersByGroup = new Map();
-  getPromptItems(list).forEach(item => {
-    const groupId = item.dataset.tacPresetGroupId;
-    const identifier = getPromptIdentifier(item);
-    if (!groupId || !identifier) return;
-    if (!identifiersByGroup.has(groupId)) identifiersByGroup.set(groupId, []);
-    identifiersByGroup.get(groupId).push(identifier);
-  });
-  store.groups.forEach(group => {
-    const nextMembers = identifiersByGroup.get(group.id) || [];
-    if (nextMembers.join('\u0001') !== group.memberIdentifiers.join('\u0001')) {
-      group.memberIdentifiers = nextMembers;
-      changed = true;
-    }
-  });
-  const before = store.groups.length;
-  store.groups = store.groups.filter(group => group.memberIdentifiers.length > 0);
-  if (before !== store.groups.length) changed = true;
-  if (changed) saveSettings();
-}
-
-function renderPresetEntryGroupsNow({ syncFromDom = false } = {}) {
-  if (!isPresetFeatureEnabled()) return;
-  if (syncFromDom) syncPresetEntryGroupsFromDom();
-  applyPresetEntryGroups();
-}
-
-function schedulePresetEntryRender(delay = 120, options = {}) {
-  if (!isPresetFeatureEnabled()) return;
-  clearTimeout(state.presetEntryTimer);
-  state.presetEntryTimer = setTimeout(() => {
-    if (!isPresetFeatureEnabled()) return;
-    renderPresetEntryGroupsNow(options);
-  }, delay);
-}
-
-function schedulePresetEntryFrameRender(options = {}) {
-  if (!isPresetFeatureEnabled() || state.presetEntryFrame) return;
-  const scheduleFrame = window.requestAnimationFrame || (callback => setTimeout(callback, 0));
-  state.presetEntryFrame = scheduleFrame(() => {
-    state.presetEntryFrame = null;
-    renderPresetEntryGroupsNow(options);
-  });
-}
-
-function getPresetEntryPointer(event) {
-  const pointer = event?.originalEvent || event;
-  const touch = pointer?.changedTouches?.[0] || pointer?.touches?.[0];
-  const clientX = pointer?.clientX ?? touch?.clientX ?? state.presetEntryDragPoint?.clientX;
-  const clientY = pointer?.clientY ?? touch?.clientY ?? state.presetEntryDragPoint?.clientY;
-  if (typeof clientX !== 'number' || typeof clientY !== 'number') return null;
-  return { clientX, clientY };
-}
-
-function rememberPresetEntryDragPoint(event) {
-  const point = getPresetEntryPointer(event);
-  if (point) state.presetEntryDragPoint = point;
-}
-
-function inferPresetEntryDropGroupByPoint(point) {
-  if (!point) return null;
-  const list = getPromptList();
-  if (!list) return null;
-  const listRect = list.getBoundingClientRect();
-  if (point.clientX < listRect.left - 48 || point.clientX > listRect.right + 48) return null;
-  const toleranceY = 28;
-  let best = null;
-  const headers = Array.from(list.querySelectorAll('.tac-preset-group-header'));
-  headers.forEach((header, index) => {
-    const groupId = header.dataset.groupId;
-    if (!groupId) return;
-    const nextHeader = headers[index + 1];
-    const headerRect = header.getBoundingClientRect();
-    const nextHeaderTop = nextHeader?.getBoundingClientRect().top;
-    let contentBottom = headerRect.bottom;
-    const endMarker = list.querySelector(`.tac-preset-group-end[data-group-id="${escapeCssIdentifier(groupId)}"]`);
-    let node = header.nextElementSibling;
-    while (node && !node.classList?.contains('tac-preset-group-header')) {
-      if (node.matches?.('li[data-pm-identifier]')) {
-        const rect = node.getBoundingClientRect();
-        if (rect.height > 0) contentBottom = Math.max(contentBottom, rect.bottom);
-      }
-      node = node.nextElementSibling;
-    }
-    if (endMarker) {
-      const endRect = endMarker.getBoundingClientRect();
-      contentBottom = Math.max(contentBottom, endRect.bottom);
-    }
-    const top = headerRect.top - toleranceY;
-    const bottom = typeof nextHeaderTop === 'number'
-      ? Math.max(contentBottom, nextHeaderTop - 6)
-      : contentBottom + toleranceY;
-    if (point.clientY < top || point.clientY > bottom) return;
-    const centerY = (top + bottom) / 2;
-    const distance = Math.abs(point.clientY - centerY);
-    if (!best || distance < best.distance) {
-      best = { groupId, distance };
-    }
-  });
-  return best?.groupId || null;
-}
-
-function inferPresetEntryDropGroup(event, item) {
-  const point = getPresetEntryPointer(event);
-  if (point && typeof document.elementsFromPoint === 'function') {
-    const elements = document.elementsFromPoint(point.clientX, point.clientY);
-    for (const element of elements) {
-      if (!(element instanceof Element) || element === item || item?.contains(element)) continue;
-      const groupedItem = element.closest('li[data-pm-identifier][data-tac-preset-group-id]');
-      if (groupedItem?.dataset?.tacPresetGroupId) return groupedItem.dataset.tacPresetGroupId;
-      const wrapper = element.closest('.tac-preset-group-wrapper');
-      if (wrapper?.dataset?.groupId) return wrapper.dataset.groupId;
-      const header = element.closest('.tac-preset-group-header');
-      if (header?.dataset?.groupId) return header.dataset.groupId;
-    }
-  }
-  return inferPresetEntryDropGroupByPoint(point);
-}
-
-function reassignDraggedPresetEntry(identifier, targetGroupId) {
-  if (!identifier) return;
-  const store = getPresetEntryStore();
-  const orderedIdentifiers = getPromptItems().map(getPromptIdentifier).filter(Boolean);
-  let changed = false;
-  store.groups.forEach(group => {
-    const before = group.memberIdentifiers.length;
-    group.memberIdentifiers = group.memberIdentifiers.filter(value => value !== identifier);
-    if (before !== group.memberIdentifiers.length) changed = true;
-  });
-  const target = targetGroupId ? store.groups.find(group => group.id === targetGroupId) : null;
-  if (target) {
-    const targetSet = new Set([...target.memberIdentifiers, identifier]);
-    const nextMembers = orderedIdentifiers.filter(value => targetSet.has(value));
-    if (nextMembers.join('\u0001') !== target.memberIdentifiers.join('\u0001')) {
-      target.memberIdentifiers = nextMembers;
-      changed = true;
-    }
-  }
-  if (target && !target.memberIdentifiers.includes(identifier)) {
-    target.memberIdentifiers.push(identifier);
-    changed = true;
-  }
-  const before = store.groups.length;
-  store.groups = store.groups.filter(group => group.memberIdentifiers.length > 0);
-  if (before !== store.groups.length) changed = true;
-  if (changed) saveSettings();
-}
-
-function bindPresetEntrySortEvents(list) {
-  if (!list || list.dataset.tacPresetSortBound) return;
-  const jquery = window.jQuery || window.$;
-  if (!jquery?.fn?.on) return;
-  list.dataset.tacPresetSortBound = '1';
-  jquery(list)
-    .on('sortstart.tac-preset-grouping sort.tac-preset-grouping', event => {
-      rememberPresetEntryDragPoint(event);
-    })
-    .on('sortstop.tac-preset-grouping', (event, ui) => {
-      rememberPresetEntryDragPoint(event);
-      const item = ui?.item?.[0];
-      const identifier = getPromptIdentifier(item);
-      const targetGroupId = inferPresetEntryDropGroup(event, item);
-      setTimeout(() => {
-        reassignDraggedPresetEntry(identifier, targetGroupId);
-        state.presetEntryDragPoint = null;
-        schedulePresetEntryRender(0);
-      }, 0);
-    });
-}
-
-function bindPresetEntryPointerTracking() {
-  if (state.presetEntryPointerBound) return;
-  state.presetEntryPointerBound = true;
-  ['pointermove', 'mousemove', 'touchmove', 'pointerup', 'mouseup', 'touchend'].forEach(eventName => {
-    document.addEventListener(eventName, rememberPresetEntryDragPoint, { passive: true, capture: true });
-  });
-}
-
-function togglePresetEntryGroup(groupId) {
-  const store = getPresetEntryStore();
-  const group = store.groups.find(item => item.id === groupId);
-  if (!group) return;
-  group.collapsed = !group.collapsed;
-  saveSettings();
-  applyPresetEntryGroups();
-}
-
-function renamePresetEntryGroup(groupId) {
-  const store = getPresetEntryStore();
-  const group = store.groups.find(item => item.id === groupId);
-  if (!group) return;
-  const nextName = normalizeTag(window.prompt('分类名称', group.name));
-  if (!nextName) return;
-  group.name = nextName;
-  saveSettings();
-  applyPresetEntryGroups();
-}
-
-function dissolvePresetEntryGroup(groupId) {
-  const store = getPresetEntryStore();
-  const index = store.groups.findIndex(item => item.id === groupId);
-  if (index < 0) return;
-  store.groups.splice(index, 1);
-  saveSettings();
-  applyPresetEntryGroups();
-}
-
-function createPresetEntryGroup(endItem) {
-  const list = getPromptList();
-  const selection = state.presetEntrySelection;
-  const endIdentifier = getPromptIdentifier(endItem);
-  if (!list || !selection?.startIdentifier || !endIdentifier) return;
-
-  const identifiers = getPromptItems(list).map(getPromptIdentifier).filter(Boolean);
-  const startIndex = identifiers.indexOf(selection.startIdentifier);
-  const endIndex = identifiers.indexOf(endIdentifier);
-  if (startIndex < 0 || endIndex < 0) return;
-  const from = Math.min(startIndex, endIndex);
-  const to = Math.max(startIndex, endIndex);
-  const members = identifiers.slice(from, to + 1);
-  if (!members.length) return;
-
-  const store = getPresetEntryStore();
-  store.groups.forEach(group => {
-    group.memberIdentifiers = group.memberIdentifiers.filter(identifier => !members.includes(identifier));
-  });
-  store.groups = store.groups.filter(group => group.memberIdentifiers.length > 0);
-  const name = normalizeTag(window.prompt('分类名称', '分类'));
-  if (!name) {
-    state.presetEntrySelection = null;
-    renderPresetEntrySelection();
+async function importThemeFilesSequentially(input, files) {
+  if (typeof DataTransfer !== 'function') {
+    notify('error', '当前浏览器不支持批量传递文件，请升级浏览器后重试。');
     return;
   }
-  store.groups.push({
-    id: makePresetEntryGroupId(),
-    name,
-    collapsed: false,
-    memberIdentifiers: members,
-  });
-  state.presetEntrySelection = null;
-  saveSettings();
-  applyPresetEntryGroups();
-}
 
-function handlePresetEntryListClick(event) {
-  const selection = state.presetEntrySelection;
-  if (!selection) return;
-  if (event.target.closest('.prompt_manager_prompt_controls, .tac-preset-group-header')) return;
-  const item = event.target.closest('li[data-pm-identifier]');
-  if (!item) return;
-  event.preventDefault();
-  event.stopPropagation();
-  createPresetEntryGroup(item);
-}
+  let imported = 0;
+  let skipped = 0;
+  let firstImportedTheme = '';
+  let metadataChanged = false;
+  state.batchThemeImportActive = true;
+  try {
+    for (const file of files) {
+      let themeName = '';
+      let parsedTheme = null;
+      try {
+        parsedTheme = JSON.parse(await file.text());
+        themeName = normalizeTag(parsedTheme?.name);
+        if (!themeName) throw new Error('missing theme name');
+      } catch (error) {
+        console.warn('TavernAssetClassifier: invalid theme file', file.name, error);
+        skipped += 1;
+        continue;
+      }
 
-function getPromptItemDisabledClass(item) {
-  const promptClass = Array.from(item?.classList || []).find(className => className.endsWith('prompt_manager_prompt'));
-  if (!promptClass) return '';
-  return `${promptClass.replace(/prompt_manager_prompt$/, '')}prompt_manager_prompt_disabled`;
-}
+      if (state.allThemeOptions.some(option => option.value === themeName || option.text === themeName)
+        || Array.from(getThemeSelect()?.options ?? []).some(option => option.value === themeName)) {
+        skipped += 1;
+        continue;
+      }
 
-function setPromptItemEnabledUi(item, enabled) {
-  const disabledClass = getPromptItemDisabledClass(item);
-  if (disabledClass) item.classList.toggle(disabledClass, !enabled);
-  const toggle = item.querySelector('.prompt-manager-toggle-action');
-  toggle?.classList.toggle('fa-toggle-on', enabled);
-  toggle?.classList.toggle('fa-toggle-off', !enabled);
-}
-
-function handlePresetEntryToggleClick(event) {
-  const toggle = event.target.closest?.('.prompt-manager-toggle-action');
-  if (!toggle) return;
-  const item = toggle.closest('li[data-pm-identifier]');
-  const identifier = getPromptIdentifier(item);
-  const manager = promptManager;
-  if (!item || !identifier || !manager?.getPromptOrderEntry || !manager?.tokenHandler?.getCounts || !manager?.saveServiceSettings) return;
-  const list = getPromptList();
-  if (manager.configuration?.listIdentifier && list?.id !== manager.configuration.listIdentifier) return;
-
-  const promptOrderEntry = manager.getPromptOrderEntry(manager.activeCharacter, identifier);
-  if (!promptOrderEntry) return;
-
-  event.preventDefault();
-  event.stopPropagation();
-  event.stopImmediatePropagation?.();
-
-  const counts = manager.tokenHandler.getCounts();
-  if (counts && typeof counts === 'object') counts[identifier] = null;
-  promptOrderEntry.enabled = !promptOrderEntry.enabled;
-  setPromptItemEnabledUi(item, promptOrderEntry.enabled);
-  manager.saveServiceSettings();
-}
-
-function nodeContainsPromptList(node) {
-  if (!(node instanceof Element)) return false;
-  const id = node.id || '';
-  if (id.endsWith('prompt_manager_list') || (node.tagName === 'UL' && id.includes('prompt_manager'))) return true;
-  return Boolean(node.querySelector?.('#completion_prompt_manager_list, #openai_prompt_manager_list, [id$="prompt_manager_list"], ul[id*="prompt_manager"]'));
-}
-
-function nodeContainsPromptItem(node) {
-  if (!(node instanceof Element)) return false;
-  return Boolean(node.matches?.('li[data-pm-identifier]') || node.querySelector?.('li[data-pm-identifier]'));
-}
-
-function nodeIsPresetEntryDecoration(node) {
-  if (!(node instanceof Element)) return false;
-  return Boolean(node.matches?.('.tac-preset-classify-button, .tac-preset-group-header, .tac-preset-group-end'));
-}
-
-function shouldRenderPresetEntryMutations(mutations, list) {
-  return mutations.some(mutation => {
-    if (mutation.type !== 'childList') return false;
-    const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
-    if (!changedNodes.length) return false;
-
-    if (mutation.target === list) {
-      return changedNodes.some(node => !nodeIsPresetEntryDecoration(node));
-    }
-
-    return changedNodes.some(nodeContainsPromptItem);
-  });
-}
-
-function shouldInjectPresetEntryButtons(mutations) {
-  return mutations.some(mutation => {
-    if (mutation.type !== 'childList') return false;
-    return [...mutation.addedNodes, ...mutation.removedNodes].some(node => {
-      if (nodeIsPresetEntryDecoration(node)) return false;
-      if (!(node instanceof Element)) return false;
-      return Boolean(
-        node.matches?.('.prompt_manager_prompt_controls')
-          || node.querySelector?.('.prompt_manager_prompt_controls')
-          || node.closest?.('li[data-pm-identifier]'),
-      );
-    });
-  });
-}
-
-function schedulePresetEntryButtonInjection(delay = 80) {
-  if (!isPresetFeatureEnabled()) return;
-  clearTimeout(state.presetEntryButtonTimer);
-  state.presetEntryButtonTimer = setTimeout(() => {
-    state.presetEntryButtonTimer = null;
-    if (!isPresetFeatureEnabled()) return;
-    injectPresetEntryButtons();
-  }, delay);
-}
-
-function startPresetEntryGrouping() {
-  const tryStart = () => {
-    if (!isPresetFeatureEnabled()) return;
-    const list = getPromptList();
-    if (!list) {
-      setTimeout(tryStart, 600);
-      return;
-    }
-    if (!list.dataset.tacPresetGroupingBound) {
-      list.dataset.tacPresetGroupingBound = '1';
-      list.addEventListener('click', handlePresetEntryListClick, true);
-      list.addEventListener('click', handlePresetEntryToggleClick, true);
-    }
-    bindPresetEntrySortEvents(list);
-    if (!state.presetEntryObserver) {
-      state.presetEntryObserver = new MutationObserver(mutations => {
-        if (shouldRenderPresetEntryMutations(mutations, list)) {
-          clearTimeout(state.presetEntryTimer);
-          state.presetEntryTimer = null;
-          schedulePresetEntryFrameRender();
-        } else if (shouldInjectPresetEntryButtons(mutations)) {
-          schedulePresetEntryButtonInjection();
+      try {
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        input.files = transfer.files;
+        const reset = waitForThemeImportInputReset(input);
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        if (!await reset) throw new Error('theme import timed out');
+        const exists = state.allThemeOptions.some(option => option.value === themeName || option.text === themeName)
+          || Array.from(getThemeSelect()?.options ?? []).some(option => option.value === themeName);
+        if (exists) {
+          imported += 1;
+          firstImportedTheme ||= themeName;
+          if (!state.sessionImportedThemeValues.includes(themeName)) {
+            state.sessionImportedThemeValues.push(themeName);
+          }
+          const record = getThemeRecord(themeName);
+          if (record && applyInferredThemeTags(record, parsedTheme)) metadataChanged = true;
+        } else {
+          skipped += 1;
         }
-      });
-      state.presetEntryObserver.observe(list, { childList: true, subtree: true });
+      } catch (error) {
+        console.warn('TavernAssetClassifier: failed to import theme file', file.name, error);
+        skipped += 1;
+        input.value = '';
+      }
     }
-    applyPresetEntryGroups();
-  };
-  if (!isPresetFeatureEnabled()) return;
-  if (!state.presetEntryBodyObserver && document.body) {
-    state.presetEntryBodyObserver = new MutationObserver(mutations => {
-      if (!mutations.some(mutation => [...mutation.addedNodes, ...mutation.removedNodes].some(nodeContainsPromptList))) return;
-      state.presetEntryObserver?.disconnect();
-      state.presetEntryObserver = null;
-      tryStart();
-      if (!getPromptList()) setTimeout(tryStart, 0);
-    });
-    state.presetEntryBodyObserver.observe(document.body, { childList: true, subtree: true });
+  } finally {
+    state.batchThemeImportActive = false;
+    input.value = '';
   }
-  bindPresetEntryPointerTracking();
-  tryStart();
+
+  if (metadataChanged) saveSettings();
+  if (firstImportedTheme) {
+    selectTheme(firstImportedTheme, { preserveSettingsDrawer: true });
+    renderThemePicker();
+    scheduleRefresh();
+  }
+  notify(imported ? 'success' : 'warning', `批量导入完成：成功 ${imported} 个${skipped ? `，跳过 ${skipped} 个` : ''}。`);
 }
 
-function destroyPresetEntryGrouping() {
-  if (state.presetEntryTimer) {
-    clearTimeout(state.presetEntryTimer);
-    state.presetEntryTimer = null;
-  }
-  if (state.presetEntryButtonTimer) {
-    clearTimeout(state.presetEntryButtonTimer);
-    state.presetEntryButtonTimer = null;
-  }
-  if (state.presetEntryFrame) {
-    const cancelFrame = window.cancelAnimationFrame || clearTimeout;
-    cancelFrame(state.presetEntryFrame);
-    state.presetEntryFrame = null;
-  }
-  state.presetEntryObserver?.disconnect();
-  state.presetEntryObserver = null;
-  state.presetEntryBodyObserver?.disconnect();
-  state.presetEntryBodyObserver = null;
-  state.presetEntrySelection = null;
-  state.presetEntryDragPoint = null;
-  const list = getPromptList();
-  cleanupPresetEntryGrouping(list);
-  document.querySelectorAll('.tac-preset-classify-button').forEach(button => button.remove());
-  if (list) {
-    delete list.dataset.tacPresetGroupingBound;
-    delete list.dataset.tacPresetSortBound;
-    list.removeEventListener('click', handlePresetEntryListClick, true);
-    list.removeEventListener('click', handlePresetEntryToggleClick, true);
-    const jquery = window.jQuery || window.$;
-    jquery?.(list).off?.('.tac-preset-grouping');
-  }
+function enableBatchThemeImport() {
+  const input = document.querySelector('#ui_preset_import_file');
+  if (!input || input.dataset.tacBatchImport === '1') return;
+  input.multiple = true;
+  input.dataset.tacBatchImport = '1';
+  input.addEventListener('change', event => {
+    const files = Array.from(input.files ?? []);
+    if (files.length <= 1) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    input.value = '';
+    void importThemeFilesSequentially(input, files);
+  }, true);
 }
 
 function mountUi() {
   const themeBlock = document.querySelector('#UI-presets-block');
   const themeRow = document.querySelector('#themes')?.closest('.flex-container');
-  if (document.querySelector('#tac-filter-panel')) return true;
   if (!themeBlock || !themeRow) return false;
+  mountThemePicker(themeRow);
+  enableBatchThemeImport();
+  if (document.querySelector('#tac-filter-panel')) return true;
 
   const actions = document.createElement('div');
   actions.id = 'tac-theme-actions';
@@ -2248,8 +2774,16 @@ function mountUi() {
 
   const updateButton = document.querySelector('#ui-preset-update-button');
   const saveButton = document.querySelector('#ui-preset-save-button');
-  if (updateButton) actions.append(updateButton);
-  if (saveButton) actions.append(saveButton);
+  if (updateButton) {
+    updateButton.title = '覆盖保存当前美化';
+    updateButton.setAttribute('aria-label', '覆盖保存当前美化');
+    actions.append(updateButton);
+  }
+  if (saveButton) {
+    saveButton.title = '另存为新美化';
+    saveButton.setAttribute('aria-label', '另存为新美化');
+    actions.append(saveButton);
+  }
 
   const rename = document.createElement('button');
   rename.type = 'button';
@@ -2257,7 +2791,11 @@ function mountUi() {
   rename.className = 'menu_button margin0';
   rename.title = '重命名当前主题';
   rename.innerHTML = '<i class="fa-solid fa-pen-to-square"></i>';
-  rename.addEventListener('click', renameCurrentTheme);
+  rename.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    void renameCurrentTheme();
+  });
   actions.append(rename);
 
   const setButton = document.createElement('button');
@@ -2273,18 +2811,6 @@ function mountUi() {
   });
   actions.append(setButton);
 
-  const autoButton = document.createElement('button');
-  autoButton.type = 'button';
-  autoButton.id = 'tac-auto-detect-tags';
-  autoButton.className = 'menu_button';
-  autoButton.title = '自动识别标签';
-  autoButton.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i>';
-  autoButton.addEventListener('click', event => {
-    event.preventDefault();
-    event.stopPropagation();
-    autoDetectAllThemeTags();
-  });
-  actions.append(autoButton);
   themeBlock.append(actions);
 
   const details = document.createElement('details');
@@ -2300,8 +2826,12 @@ function mountUi() {
   themeBlock.append(details);
 
   getThemeSelect()?.addEventListener('change', () => {
-    scheduleRefresh();
-    setTimeout(() => syncBoundBackgroundForCurrentTheme(true), 0);
+    setTimeout(() => {
+      autoTagCurrentThemeMetadata();
+      renderThemePicker();
+      scheduleRefresh();
+      syncBoundBackgroundForCurrentTheme(true);
+    }, 0);
   });
 
   document.querySelector('#ui-preset-delete-button')?.addEventListener('click', () => {
@@ -2312,6 +2842,7 @@ function mountUi() {
       const stillVisible = Array.from(select?.options ?? []).some(option => option.value === deletedName);
       if (deletedName && !stillVisible) {
         state.allThemeOptions = state.allThemeOptions.filter(option => option.value !== deletedName);
+        state.sessionImportedThemeValues = state.sessionImportedThemeValues.filter(value => value !== deletedName);
       }
       scheduleRefresh();
     }, 900);
@@ -2326,6 +2857,10 @@ function mountUi() {
   });
 
   scheduleRefresh();
+  void autoTagAllThemeMetadata();
+  setTimeout(() => {
+    if (autoTagCurrentThemeMetadata()) scheduleRefresh();
+  }, 250);
   startThemeBackgroundSync();
   syncBoundBackgroundForCurrentTheme(true);
   return true;
@@ -2338,6 +2873,8 @@ function destroyBeautifyFeature() {
   }
   state.observer?.disconnect();
   state.observer = null;
+  state.themePickerCleanup?.();
+  state.themePickerCleanup = null;
   stopThemeBackgroundSync();
   restoreThemeSelectOptions();
   const themeBlock = document.querySelector('#UI-presets-block');
@@ -2349,12 +2886,15 @@ function destroyBeautifyFeature() {
     if (saveButton) themeBlock.insertBefore(saveButton, actions);
   }
   actions?.remove();
+  document.querySelector('#tac-theme-picker')?.remove();
+  document.querySelector('#tac-theme-picker-menu')?.remove();
+  getThemeSelect()?.classList.remove('tac-native-theme-select');
+  getThemeSelect()?.closest('.tac-theme-picker-row')?.classList.remove('tac-theme-picker-row');
   document.querySelector('#tac-filter-panel')?.remove();
 }
 
 function startBeautifyFeature() {
   const tryMount = () => {
-    if (!isBeautifyFeatureEnabled()) return;
     if (mountUi()) {
       observeThemeOptions();
       return;
@@ -2368,9 +2908,33 @@ function observeThemeOptions() {
   const select = getThemeSelect();
   if (!select || state.observer) return;
   snapshotThemeOptions();
-  state.observer = new MutationObserver(() => {
+  state.observer = new MutationObserver(mutations => {
     if (state.suppressThemeObserver) return;
+    const knownValues = new Set(state.allThemeOptions.map(option => option.value));
+    const addedValues = [];
+    const removedValues = [];
+    const collectValues = (nodes, target) => nodes.forEach(node => {
+      if (!(node instanceof Element)) return;
+      if (node.matches('option')) target.push(normalizeTag(node.value));
+      node.querySelectorAll?.('option').forEach(option => target.push(normalizeTag(option.value)));
+    });
+    mutations.forEach(mutation => {
+      collectValues(Array.from(mutation.addedNodes), addedValues);
+      collectValues(Array.from(mutation.removedNodes), removedValues);
+    });
+    const currentValues = new Set(Array.from(select.options).map(option => normalizeTag(option.value)).filter(Boolean));
+    const trulyRemoved = new Set(removedValues.filter(value => value && !currentValues.has(value)));
+    if (trulyRemoved.size) {
+      state.allThemeOptions = state.allThemeOptions.filter(option => !trulyRemoved.has(option.value));
+      state.sessionImportedThemeValues = state.sessionImportedThemeValues.filter(value => !trulyRemoved.has(value));
+    }
     snapshotThemeOptions();
+    const importedValue = addedValues.find(value => value && !knownValues.has(value));
+    if (importedValue && currentValues.has(importedValue) && !state.batchThemeImportActive) {
+      select.value = importedValue;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    renderThemePicker();
     scheduleRefresh();
   });
   state.observer.observe(select, { childList: true, subtree: true, attributes: true });
@@ -2380,12 +2944,13 @@ function getExtensionSettingsHost() {
   return document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
 }
 
-function makeBindingButton(icon, title, onClick, extraClass = '') {
+function makeBindingButton(icon, title, onClick, extraClass = '', label = '') {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = `menu_button tac-binding-icon ${extraClass}`.trim();
   button.title = title;
-  button.innerHTML = `<i class="${icon.includes(' ') ? icon : `fa-solid ${icon}`}"></i>`;
+  button.innerHTML = `<i class="${icon.includes(' ') ? icon : `fa-solid ${icon}`}"></i>${label ? '<span></span>' : ''}`;
+  if (label) button.querySelector('span').textContent = label;
   button.addEventListener('click', event => {
     event.preventDefault();
     event.stopPropagation();
@@ -2396,7 +2961,15 @@ function makeBindingButton(icon, title, onClick, extraClass = '') {
 
 function makeBindingListItem(type, item, starredId) {
   const row = document.createElement('div');
-  row.className = `tac-binding-item${type === 'users' ? ' tac-binding-user-item' : ''}${starredId === item.id ? ' is-starred' : ''}`;
+  const isStarred = starredId === item.id;
+  const isStacked = type === 'presets' || type === 'worldBooks';
+  row.className = `tac-binding-item${type === 'users' ? ' tac-binding-user-item' : ''}${isStacked ? ' tac-binding-stacked-item' : ''}${isStarred ? ' is-starred' : ''}`;
+  const worldBookNames = Array.isArray(item.books) ? item.books.map(book => book.name) : [];
+  const typeLabel = type === 'presets' ? '预设' : type === 'worldBooks' ? '世界书' : 'user';
+  row.dataset.searchText = [item.name, item.presetName, item.presetValue, item.userName, ...worldBookNames, typeLabel]
+    .filter(Boolean)
+    .join(' ')
+    .toLocaleLowerCase('zh-Hans-CN');
 
   if (type === 'users') {
     const avatar = document.createElement('div');
@@ -2421,6 +2994,8 @@ function makeBindingListItem(type, item, starredId) {
   meta.className = 'tac-binding-item-meta';
   if (type === 'presets') {
     meta.textContent = getPresetBindingDisplayName(item);
+  } else if (type === 'worldBooks') {
+    meta.textContent = `${getWorldBookBindingSummary(item)}${worldBookNames.length ? ` · ${worldBookNames.join('、')}` : ''}`;
   } else {
     meta.textContent = item.userName || '未记录角色名';
   }
@@ -2428,13 +3003,42 @@ function makeBindingListItem(type, item, starredId) {
 
   const actions = document.createElement('div');
   actions.className = 'tac-binding-item-actions';
+  const star = makeBindingButton(
+    isStarred ? 'fa-star' : 'fa-regular fa-star',
+    isStarred ? '取消自动加载' : '标为自动加载',
+    () => starCharacterBinding(type, item.id),
+    `tac-binding-star${isStarred ? ' is-active' : ''}`,
+  );
+  star.setAttribute('aria-pressed', String(isStarred));
+  actions.append(star);
+  if (type === 'presets') {
+    actions.append(makeBindingButton('fa-rotate', '用当前预设更新绑定', () => updatePresetBinding(item.id), 'tac-binding-update'));
+  } else if (type === 'worldBooks') {
+    actions.append(makeBindingButton('fa-rotate', '用当前世界书及条目更新绑定', () => updateWorldBookBinding(item.id), 'tac-binding-update'));
+  }
+  const applyBinding = () => {
+    if (type === 'presets') return applyPresetBinding(item);
+    if (type === 'worldBooks') return applyWorldBookBinding(item);
+    return applyUserBinding(item);
+  };
   actions.append(
-    makeBindingButton(starredId === item.id ? 'fa-star' : 'fa-regular fa-star', starredId === item.id ? '取消自动加载' : '标为自动加载', () => starCharacterBinding(type, item.id)),
-    makeBindingButton('fa-right-to-bracket', '应用绑定', () => type === 'presets' ? applyPresetBinding(item) : applyUserBinding(item)),
+    makeBindingButton('fa-right-to-bracket', '应用绑定', applyBinding),
     makeBindingButton('fa-trash', '删除绑定', () => deleteCharacterBinding(type, item.id)),
   );
   row.append(main, actions);
   return row;
+}
+
+function applyCharacterBindingSearch(root, query) {
+  const normalized = normalizeTag(query).toLocaleLowerCase('zh-Hans-CN');
+  root.querySelectorAll('.tac-binding-list').forEach(list => {
+    const items = Array.from(list.querySelectorAll(':scope > .tac-binding-item'));
+    items.forEach(item => {
+      item.hidden = Boolean(normalized) && !item.dataset.searchText.includes(normalized);
+    });
+    const empty = list.querySelector(':scope > .tac-binding-search-empty');
+    if (empty) empty.hidden = !normalized || items.some(item => !item.hidden);
+  });
 }
 
 function renderPresetBindingModule(bindings) {
@@ -2451,6 +3055,11 @@ function renderPresetBindingModule(bindings) {
   const list = section.querySelector('.tac-binding-list');
   if (bindings.presets.items.length) {
     bindings.presets.items.forEach(item => list.append(makeBindingListItem('presets', item, bindings.presets.starredId)));
+    const empty = document.createElement('div');
+    empty.className = 'tac-binding-empty tac-binding-search-empty';
+    empty.textContent = '没有匹配的预设绑定。';
+    empty.hidden = true;
+    list.append(empty);
   } else {
     list.innerHTML = '<div class="tac-binding-empty">还没有保存预设绑定。</div>';
   }
@@ -2459,23 +3068,85 @@ function renderPresetBindingModule(bindings) {
 
 function renderBeautifyBindingModule(bindings) {
   const section = document.createElement('section');
-  section.className = 'tac-binding-module';
+  section.className = 'tac-binding-module tac-beautify-binding-module';
   section.innerHTML = `
-    <div class="tac-binding-module-head">
+    <div class="tac-binding-module-head tac-beautify-binding-head">
       <div class="tac-binding-module-title"><i class="fa-solid fa-palette"></i> 美化绑定</div>
+      <div class="tac-binding-button-row">
+        <button type="button" class="menu_button" data-action="choose" title="选择美化"><i class="fa-solid fa-list"></i><span>选择</span></button>
+        <button type="button" class="menu_button" data-action="save-current" title="保存当前美化"><i class="fa-solid fa-floppy-disk"></i><span>当前</span></button>
+        <button type="button" class="menu_button" data-action="clear" title="取消绑定"><i class="fa-solid fa-link-slash"></i><span>取消</span></button>
+      </div>
     </div>
     <div class="tac-binding-current"></div>
-    <div class="tac-binding-button-row">
-      <button type="button" class="menu_button" data-action="choose" title="选择美化"><i class="fa-solid fa-list"></i><span>选择</span></button>
-      <button type="button" class="menu_button" data-action="save-current" title="保存当前美化"><i class="fa-solid fa-floppy-disk"></i><span>当前</span></button>
-      <button type="button" class="menu_button" data-action="clear" title="取消绑定"><i class="fa-solid fa-link-slash"></i><span>取消</span></button>
-    </div>
   `;
   const current = section.querySelector('.tac-binding-current');
   current.textContent = bindings.beautify.themeName ? `当前绑定：${bindings.beautify.themeName}` : '当前未绑定角色卡美化。';
   section.querySelector('[data-action="save-current"]')?.addEventListener('click', () => saveBeautifyBinding(getCurrentThemeName()));
   section.querySelector('[data-action="choose"]')?.addEventListener('click', openBeautifyBindingPicker);
   section.querySelector('[data-action="clear"]')?.addEventListener('click', clearBeautifyBinding);
+  return section;
+}
+
+function renderCharacterRelationModule(bindings) {
+  const section = document.createElement('section');
+  section.className = `tac-binding-module tac-character-relation-module${state.characterRelationDeleteMode ? ' is-delete-mode' : ''}`;
+  section.innerHTML = `
+    <div class="tac-binding-module-head">
+      <div class="tac-binding-module-title"><i class="fa-solid fa-link"></i> 角色卡关联</div>
+      <div class="tac-character-relation-actions">
+        <button type="button" class="menu_button tac-binding-icon" data-action="add" title="从角色卡库添加"><i class="fa-solid fa-plus"></i></button>
+        <button type="button" class="menu_button tac-binding-icon${state.characterRelationDeleteMode ? ' is-active' : ''}" data-action="delete-mode" title="显示或隐藏删除按钮"><i class="fa-solid fa-trash"></i></button>
+      </div>
+    </div>
+    <div class="tac-character-relation-grid"></div>
+  `;
+  section.querySelector('[data-action="add"]').addEventListener('click', openCharacterLibraryPicker);
+  const deleteMode = section.querySelector('[data-action="delete-mode"]');
+  deleteMode.disabled = !bindings.relatedCharacters.length;
+  deleteMode.addEventListener('click', () => {
+    state.characterRelationDeleteMode = !state.characterRelationDeleteMode;
+    renderCharacterBindingPanel();
+  });
+
+  const grid = section.querySelector('.tac-character-relation-grid');
+  if (!bindings.relatedCharacters.length) {
+    grid.innerHTML = '<div class="tac-binding-empty">还没有关联角色卡，点击“＋”从角色卡库添加。</div>';
+    return section;
+  }
+  bindings.relatedCharacters.forEach(reference => {
+    const target = findCharacterByAvatar(reference.avatar);
+    const name = target?.name || reference.name || reference.avatar;
+    const card = document.createElement('div');
+    card.className = `tac-character-relation-card${target ? '' : ' is-missing'}`;
+    card.role = 'button';
+    card.tabIndex = target ? 0 : -1;
+    card.title = target ? `前往角色卡：${name}` : `角色卡已不在角色库：${name}`;
+    card.innerHTML = `
+      <span class="tac-character-relation-avatar"><img alt=""></span>
+      <span class="tac-character-relation-name"></span>
+      <button type="button" class="tac-character-relation-remove" title="删除关联" aria-label="删除关联"><i class="fa-solid fa-xmark"></i></button>
+    `;
+    const image = card.querySelector('img');
+    image.src = target ? getThumbnailUrl('avatar', target.avatar) : '';
+    image.alt = name;
+    card.querySelector('.tac-character-relation-name').textContent = name;
+    card.querySelector('.tac-character-relation-remove').addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      void confirmRemoveRelatedCharacter(reference.avatar, name);
+    });
+    card.addEventListener('click', event => {
+      if (!target || event.target.closest('.tac-character-relation-remove')) return;
+      void switchToRelatedCharacter(reference.avatar, name);
+    });
+    card.addEventListener('keydown', event => {
+      if (!target || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault();
+      void switchToRelatedCharacter(reference.avatar, name);
+    });
+    grid.append(card);
+  });
   return section;
 }
 
@@ -2493,8 +3164,38 @@ function renderUserBindingModule(bindings) {
   const list = section.querySelector('.tac-binding-list');
   if (bindings.users.items.length) {
     bindings.users.items.forEach(item => list.append(makeBindingListItem('users', item, bindings.users.starredId)));
+    const empty = document.createElement('div');
+    empty.className = 'tac-binding-empty tac-binding-search-empty';
+    empty.textContent = '没有匹配的 user 绑定。';
+    empty.hidden = true;
+    list.append(empty);
   } else {
     list.innerHTML = '<div class="tac-binding-empty">还没有保存 user 绑定。</div>';
+  }
+  return section;
+}
+
+function renderWorldBookBindingModule(bindings) {
+  const section = document.createElement('section');
+  section.className = 'tac-binding-module';
+  section.innerHTML = `
+    <div class="tac-binding-module-head">
+      <div class="tac-binding-module-title"><i class="fa-solid fa-book-atlas"></i> 世界书绑定</div>
+      <button type="button" class="menu_button tac-binding-save" title="保存当前启用及角色挂载的全部世界书和条目"><i class="fa-solid fa-floppy-disk"></i><span>保存</span></button>
+    </div>
+    <div class="tac-binding-list"></div>
+  `;
+  section.querySelector('.tac-binding-save')?.addEventListener('click', saveWorldBookBinding);
+  const list = section.querySelector('.tac-binding-list');
+  if (bindings.worldBooks.items.length) {
+    bindings.worldBooks.items.forEach(item => list.append(makeBindingListItem('worldBooks', item, bindings.worldBooks.starredId)));
+    const empty = document.createElement('div');
+    empty.className = 'tac-binding-empty tac-binding-search-empty';
+    empty.textContent = '没有匹配的世界书绑定。';
+    empty.hidden = true;
+    list.append(empty);
+  } else {
+    list.innerHTML = '<div class="tac-binding-empty">还没有保存世界书绑定。</div>';
   }
   return section;
 }
@@ -2513,57 +3214,55 @@ function renderCharacterBindingPanel() {
   status.className = 'tac-binding-character-status';
   status.innerHTML = `<i class="fa-solid fa-id-card"></i><span></span>`;
   status.querySelector('span').textContent = `当前角色：${character.name || character.avatar || '未命名角色'}`;
+  const search = document.createElement('div');
+  search.className = 'tac-binding-search';
+  search.innerHTML = `
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <input type="search" class="text_pole tac-binding-search-input" placeholder="搜索角色绑定" autocomplete="off">
+    <button type="button" class="menu_button tac-binding-search-clear" title="清空搜索"><i class="fa-solid fa-xmark"></i></button>
+  `;
+  const searchInput = search.querySelector('.tac-binding-search-input');
+  searchInput.value = state.characterBindingQuery;
   const grid = document.createElement('div');
   grid.className = 'tac-binding-grid';
   grid.append(
-    renderPresetBindingModule(bindings),
     renderBeautifyBindingModule(bindings),
+    renderPresetBindingModule(bindings),
     renderUserBindingModule(bindings),
+    renderWorldBookBindingModule(bindings),
+    renderCharacterRelationModule(bindings),
   );
-  body.append(status, grid);
+  searchInput.addEventListener('input', () => {
+    state.characterBindingQuery = searchInput.value;
+    applyCharacterBindingSearch(body, state.characterBindingQuery);
+  });
+  search.querySelector('.tac-binding-search-clear').addEventListener('click', () => {
+    state.characterBindingQuery = '';
+    searchInput.value = '';
+    applyCharacterBindingSearch(body, '');
+    searchInput.focus();
+  });
+  body.append(status, search, grid);
+  applyCharacterBindingSearch(body, state.characterBindingQuery);
 }
 
 function renderFeatureSettingsPanel() {
-  const settings = getFeatureSettings();
   const panel = document.createElement('div');
   panel.id = 'tac-extension-settings';
   panel.className = 'extension_container';
   panel.innerHTML = `
     <div class="inline-drawer">
       <div class="inline-drawer-toggle inline-drawer-header">
-        <b>分类器功能</b>
+        <b>美化与角色绑定</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
       </div>
       <div class="inline-drawer-content">
-        <div class="tac-settings-card flex-container flexFlowColumn flexGap5">
-          <div class="tac-settings-card-title">功能开关</div>
-          <label class="checkbox_label alignItemsCenter flexGap5" for="tac-enable-beautify">
-            <input id="tac-enable-beautify" type="checkbox" data-feature="beautify" ${settings.beautify ? 'checked' : ''}>
-            <small>美化分类</small>
-          </label>
-          <label class="checkbox_label alignItemsCenter flexGap5" for="tac-enable-presets">
-            <input id="tac-enable-presets" type="checkbox" data-feature="presets" ${settings.presets ? 'checked' : ''}>
-            <small>预设分类</small>
-          </label>
-        </div>
-        <details id="tac-character-binding-panel" class="tac-settings-card tac-character-binding-panel">
-          <summary>
-            <span><i class="fa-solid fa-link"></i> 角色绑定</span>
-            <i class="fa-solid fa-chevron-down tac-chevron"></i>
-          </summary>
+        <div id="tac-character-binding-panel" class="tac-settings-card tac-character-binding-panel">
           <div id="tac-character-binding-body"></div>
-        </details>
+        </div>
       </div>
     </div>
   `;
-  panel.addEventListener('change', event => {
-    const input = event.target.closest('input[data-feature]');
-    if (!input) return;
-    const nextSettings = getSettings();
-    nextSettings.features[input.dataset.feature] = input.checked;
-    saveSettings();
-    applyFeatureState();
-  });
   setTimeout(renderCharacterBindingPanel, 0);
   return panel;
 }
@@ -2571,10 +3270,6 @@ function renderFeatureSettingsPanel() {
 function mountFeatureSettingsPanel() {
   const existing = document.querySelector('#tac-extension-settings');
   if (existing) {
-    const beautify = existing.querySelector('input[data-feature="beautify"]');
-    const presets = existing.querySelector('input[data-feature="presets"]');
-    if (beautify) beautify.checked = isBeautifyFeatureEnabled();
-    if (presets) presets.checked = isPresetFeatureEnabled();
     renderCharacterBindingPanel();
     return true;
   }
@@ -2593,29 +3288,16 @@ function startFeatureSettingsPanel() {
   tryMount();
 }
 
-function applyFeatureState() {
-  if (isBeautifyFeatureEnabled()) {
-    startBeautifyFeature();
-  } else {
-    destroyBeautifyFeature();
-  }
-
-  if (isPresetFeatureEnabled()) {
-    startPresetEntryGrouping();
-  } else {
-    destroyPresetEntryGrouping();
-  }
-}
-
 function handleCharacterBindingContextChanged() {
   state.lastAppliedCharacterBindingKey = '';
+  state.characterRelationDeleteMode = false;
   scheduleCharacterBindingRender();
   scheduleCharacterBindingApply();
 }
 
 function start() {
   startFeatureSettingsPanel();
-  applyFeatureState();
+  startBeautifyFeature();
   eventSource?.on?.(event_types.APP_READY, handleCharacterBindingContextChanged);
   eventSource?.on?.(event_types.CHAT_CHANGED, handleCharacterBindingContextChanged);
   eventSource?.on?.(event_types.CHARACTER_EDITED, scheduleCharacterBindingRender);
