@@ -475,31 +475,42 @@
   display: none;
 }
 
-.tac-binding-picker-card {
-  width: min(520px, 100%);
+.tac-character-transfer-card {
+  width: min(640px, 100%);
 }
 
-.tac-binding-picker-list {
+.tac-character-transfer-body {
   display: grid;
-  gap: 6px;
+  gap: 12px;
   min-height: 0;
-  max-height: min(560px, 72dvh);
-  padding: 12px;
+  padding: 14px;
   overflow: auto;
-  overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
 }
 
-.tac-binding-picker-item {
+.tac-character-transfer-body > p {
+  margin: 0;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 66%, transparent);
+  font-size: 0.88em;
+  line-height: 1.45;
+}
+
+.tac-character-transfer-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.tac-character-transfer-option {
+  position: relative;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  gap: 10px;
   align-items: center;
-  width: 100%;
-  min-height: 34px;
-  padding: 8px;
-  border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 14%, transparent);
-  border-radius: 8px;
+  min-width: 0;
+  min-height: 76px;
+  padding: 10px 34px 10px 10px;
+  border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 16%, transparent);
+  border-radius: 10px;
   background: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 5%, transparent);
   color: var(--SmartThemeBodyColor, #eee);
   font: inherit;
@@ -507,23 +518,75 @@
   cursor: pointer;
 }
 
-.tac-binding-picker-item:hover,
-.tac-binding-picker-item.is-selected {
-  border-color: color-mix(in srgb, var(--SmartThemeEmColor, #9cf) 70%, transparent);
-  background: color-mix(in srgb, var(--SmartThemeEmColor, #9cf) 14%, transparent);
+.tac-character-transfer-option:hover:not(:disabled) {
+  border-color: color-mix(in srgb, #53c8a2 72%, transparent);
+  background: color-mix(in srgb, #53c8a2 11%, transparent);
 }
 
-.tac-binding-picker-name {
+.tac-character-transfer-option.is-selected {
+  border-color: #53c8a2;
+  background: color-mix(in srgb, #53c8a2 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #53c8a2 28%, transparent);
+}
+
+.tac-character-transfer-option:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.tac-character-transfer-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  background: color-mix(in srgb, #53c8a2 16%, transparent);
+  color: #71dfbd;
+  font-size: 1.05em;
+}
+
+.tac-character-transfer-copy {
+  display: grid;
+  gap: 3px;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.tac-character-transfer-copy strong {
+  line-height: 1.2;
+}
+
+.tac-character-transfer-copy small {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 58%, transparent);
+  font-size: 0.76em;
+  line-height: 1.3;
+}
+
+.tac-character-transfer-count {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 68%, transparent);
+  font-size: 0.76em;
   white-space: nowrap;
 }
 
-.tac-binding-picker-state {
-  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 58%, transparent);
-  font-size: 0.84em;
-  white-space: nowrap;
+.tac-character-transfer-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #53c8a2;
+  color: #10221c;
+  font-size: 0.65em;
+  opacity: 0;
+  transform: scale(0.7);
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.tac-character-transfer-option.is-selected .tac-character-transfer-check {
+  opacity: 1;
+  transform: scale(1);
 }
 
 .tac-confirm-body {
@@ -1389,13 +1452,12 @@ html > #tac-binding-modal {
     height: 30px;
   }
 
-  .tac-binding-picker-list {
-    max-height: calc(100dvh - 120px);
-    padding: 10px;
+  .tac-character-transfer-grid {
+    grid-template-columns: 1fr;
   }
 
-  .tac-binding-picker-item {
-    min-height: 40px;
+  .tac-character-transfer-option {
+    min-height: 68px;
   }
 
   #tac-theme-actions {

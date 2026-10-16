@@ -243,8 +243,22 @@ function normalizeCharacterBindings(bindings = {}) {
   const users = root.users && typeof root.users === 'object' ? root.users : {};
   const worldBooks = root.worldBooks && typeof root.worldBooks === 'object' ? root.worldBooks : {};
   const beautify = root.beautify && typeof root.beautify === 'object' ? root.beautify : {};
+  const legacyThemeName = normalizeTag(beautify.themeName);
+  const beautifyItems = (Array.isArray(beautify.items) ? beautify.items : [])
+    .filter(Boolean)
+    .map(item => ({
+      id: String(item.id || makeBindingId()),
+      themeName: normalizeTag(item.themeName),
+      createdAt: normalizeTag(item.createdAt),
+    }))
+    .filter(item => item.themeName);
+  if (!beautifyItems.length && legacyThemeName) {
+    beautifyItems.push({ id: 'legacy-beautify', themeName: legacyThemeName, createdAt: normalizeTag(beautify.updatedAt) });
+  }
+  const uniqueBeautifyItems = Array.from(new Map(beautifyItems.map(item => [normalizeThemeNameKey(item.themeName), item])).values());
+  const requestedBeautifyStar = normalizeTag(beautify.starredId) || (legacyThemeName ? 'legacy-beautify' : '');
   return {
-    version: 3,
+    version: 4,
     presets: {
       starredId: normalizeTag(presets.starredId),
       items: Array.isArray(presets.items) ? presets.items.filter(Boolean).map(item => ({
@@ -258,8 +272,8 @@ function normalizeCharacterBindings(bindings = {}) {
       })) : [],
     },
     beautify: {
-      themeName: normalizeTag(beautify.themeName),
-      updatedAt: normalizeTag(beautify.updatedAt),
+      starredId: uniqueBeautifyItems.some(item => item.id === requestedBeautifyStar) ? requestedBeautifyStar : '',
+      items: uniqueBeautifyItems,
     },
     relatedCharacters: Array.from(new Map((Array.isArray(root.relatedCharacters) ? root.relatedCharacters : [])
       .map(item => typeof item === 'string' ? { avatar: item, name: '' } : item)
@@ -296,6 +310,7 @@ function normalizeCharacterBindings(bindings = {}) {
             primary: normalizeTag(item.characterBooks?.primary),
             additional: uniqueTags(item.characterBooks?.additional),
           },
+          preserveCharacterBooks: Boolean(item.preserveCharacterBooks),
           books,
         };
       }) : [],
@@ -414,6 +429,118 @@ async function removeCharacterFromRelationGroup(targetAvatar) {
   } catch (error) {
     console.error('TavernAssetClassifier: failed to remove character relation', error);
     notify('error', '删除角色卡关联失败，请检查控制台。');
+    return false;
+  }
+}
+
+function getTransferableWorldBookBinding(item) {
+  const characterBookNames = new Set(uniqueTags([
+    item?.characterBooks?.primary,
+    ...(item?.characterBooks?.additional ?? []),
+  ]));
+  const globalBookNames = new Set(uniqueTags(item?.globalBooks).filter(name => !characterBookNames.has(name)));
+  const books = (Array.isArray(item?.books) ? item.books : [])
+    .filter(book => globalBookNames.has(normalizeTag(book?.name)))
+    .map(book => ({
+      name: normalizeTag(book.name),
+      data: { entries: cloneData(book?.data?.entries ?? {}) },
+    }))
+    .filter(book => Object.keys(book.data.entries).length);
+  if (!books.length) return null;
+  return {
+    ...cloneData(item),
+    globalBooks: books.map(book => book.name),
+    characterBooks: { primary: '', additional: [] },
+    preserveCharacterBooks: true,
+    books,
+  };
+}
+
+function getCharacterTransferCounts(bindings) {
+  return {
+    beautify: bindings.beautify.items.length,
+    presets: bindings.presets.items.length,
+    worldBooks: bindings.worldBooks.items.reduce((total, item) => {
+      const transferable = getTransferableWorldBookBinding(item);
+      return total + (transferable?.books ?? []).reduce(
+        (count, book) => count + Object.keys(book.data.entries).length,
+        0,
+      );
+    }, 0),
+    users: bindings.users.items.length,
+  };
+}
+
+function getTransferredBindingSignature(type, item) {
+  if (type === 'beautify') return normalizeThemeNameKey(item.themeName);
+  if (type === 'presets') return JSON.stringify([item.presetName, item.presetValue, item.promptOrder]);
+  if (type === 'users') return JSON.stringify([item.avatar, item.userName]);
+  return JSON.stringify([item.globalBooks, item.books]);
+}
+
+function mergeTransferredBindingBucket(type, sourceBucket, targetBucket, transform = item => cloneData(item)) {
+  const existingBySignature = new Map(targetBucket.items.map(item => [getTransferredBindingSignature(type, item), item]));
+  const transferred = [];
+  let inheritedStarId = '';
+  for (const sourceItem of sourceBucket.items) {
+    const item = transform(sourceItem);
+    if (!item) continue;
+    const signature = getTransferredBindingSignature(type, item);
+    const existing = existingBySignature.get(signature);
+    if (existing) {
+      if (sourceBucket.starredId === sourceItem.id) inheritedStarId = existing.id;
+      continue;
+    }
+    item.id = makeBindingId();
+    item.createdAt = new Date().toISOString();
+    existingBySignature.set(signature, item);
+    transferred.push(item);
+    if (sourceBucket.starredId === sourceItem.id) inheritedStarId = item.id;
+  }
+  targetBucket.items = [...transferred, ...targetBucket.items];
+  const hasValidTargetStar = targetBucket.items.some(item => item.id === targetBucket.starredId);
+  if (!hasValidTargetStar && inheritedStarId) targetBucket.starredId = inheritedStarId;
+  return transferred.length;
+}
+
+async function transferCharacterBindingContent(sourceAvatar, targetAvatar, selectedTypes) {
+  try {
+    const source = await loadCharacterByAvatar(sourceAvatar);
+    const target = await loadCharacterByAvatar(targetAvatar);
+    if (!source || !target) throw new Error('source or target character is missing');
+    const sourceBindings = normalizeCharacterBindings(source.character?.data?.extensions?.[EXTENSION_KEY]);
+    const targetBindings = normalizeCharacterBindings(target.character?.data?.extensions?.[EXTENSION_KEY]);
+    const transferredCounts = {};
+
+    if (selectedTypes.includes('beautify')) {
+      transferredCounts.beautify = mergeTransferredBindingBucket(
+        'beautify', sourceBindings.beautify, targetBindings.beautify,
+      );
+    }
+    if (selectedTypes.includes('presets')) {
+      transferredCounts.presets = mergeTransferredBindingBucket(
+        'presets', sourceBindings.presets, targetBindings.presets,
+      );
+    }
+    if (selectedTypes.includes('worldBooks')) {
+      transferredCounts.worldBooks = mergeTransferredBindingBucket(
+        'worldBooks', sourceBindings.worldBooks, targetBindings.worldBooks, getTransferableWorldBookBinding,
+      );
+    }
+    if (selectedTypes.includes('users')) {
+      transferredCounts.users = mergeTransferredBindingBucket(
+        'users', sourceBindings.users, targetBindings.users,
+      );
+    }
+
+    await writeExtensionField(target.id, EXTENSION_KEY, normalizeCharacterBindings(targetBindings));
+    scheduleCharacterBindingRender();
+    const total = Object.values(transferredCounts).reduce((sum, count) => sum + count, 0);
+    notify('success', total ? `已将所选内容转移到“${target.name}”。` : `“${target.name}”中已有相同内容，无需重复转移。`);
+    return true;
+  } catch (error) {
+    console.error('TavernAssetClassifier: failed to transfer character bindings', error);
+    notify('error', '转移关联角色卡内容失败，请检查控制台。');
     return false;
   }
 }
@@ -2009,7 +2136,8 @@ function getWorldBookBindingSummary(binding) {
     binding?.characterBooks?.primary,
     ...(binding?.characterBooks?.additional ?? []),
   ]).length;
-  return `全局 ${globalCount} 本 · 角色 ${characterCount} 本 · ${entryCount} 条目`;
+  const characterSummary = binding?.preserveCharacterBooks ? '角色 保留' : `角色 ${characterCount} 本`;
+  return `全局 ${globalCount} 本 · ${characterSummary} · ${entryCount} 条目`;
 }
 
 async function captureWorldBookBinding(name) {
@@ -2032,6 +2160,7 @@ async function captureWorldBookBinding(name) {
     createdAt: new Date().toISOString(),
     globalBooks,
     characterBooks,
+    preserveCharacterBooks: false,
     books,
   };
 }
@@ -2140,74 +2269,22 @@ async function saveBeautifyBinding(themeName = getCurrentThemeName()) {
   const normalized = normalizeTag(themeName);
   if (!normalized) {
     notify('info', '当前没有可绑定的美化。');
-    return;
+    return false;
   }
   const bindings = getCurrentCharacterBindings();
-  bindings.beautify.themeName = normalized;
-  bindings.beautify.updatedAt = new Date().toISOString();
-  if (await saveCurrentCharacterBindings(bindings)) notify('success', `已绑定美化：${normalized}`);
-}
-
-async function clearBeautifyBinding() {
-  const bindings = getCurrentCharacterBindings();
-  bindings.beautify.themeName = '';
-  bindings.beautify.updatedAt = new Date().toISOString();
-  if (await saveCurrentCharacterBindings(bindings)) notify('success', '已取消角色卡美化绑定。');
-}
-
-function openBeautifyBindingPicker() {
-  const names = getThemeNames();
-  if (!names.length) {
-    notify('info', '当前没有可选择的美化。');
-    return;
+  const exists = bindings.beautify.items.some(item => normalizeThemeNameKey(item.themeName) === normalizeThemeNameKey(normalized));
+  if (exists) {
+    notify('info', `美化“${normalized}”已经添加。`);
+    return false;
   }
-
-  const existing = document.querySelector('#tac-binding-modal');
-  if (existing) closeModalOverlay(existing);
-
-  const bindings = getCurrentCharacterBindings();
-  const currentTheme = normalizeTag(bindings.beautify.themeName || getCurrentThemeName());
-  const overlay = document.createElement('div');
-  overlay.id = 'tac-binding-modal';
-  document.body.classList.add('tac-modal-open');
-  trapModalEvents(overlay);
-  overlay.innerHTML = `
-    <div class="tac-modal-card tac-binding-picker-card">
-      <div class="tac-modal-head">
-        <div>
-          <div class="tac-modal-kicker">角色绑定</div>
-          <div class="tac-modal-title">选择美化</div>
-        </div>
-        <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭">
-          <i class="fa-solid fa-xmark"></i>
-        </button>
-      </div>
-      <div class="tac-binding-picker-list"></div>
-    </div>
-  `;
-
-  const list = overlay.querySelector('.tac-binding-picker-list');
-  names.forEach(name => {
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.className = `tac-binding-picker-item${name === currentTheme ? ' is-selected' : ''}`;
-    item.innerHTML = `
-      <span class="tac-binding-picker-name"></span>
-      <span class="tac-binding-picker-state"></span>
-    `;
-    item.querySelector('.tac-binding-picker-name').textContent = name;
-    item.querySelector('.tac-binding-picker-state').textContent = name === currentTheme ? '当前' : '';
-    item.addEventListener('click', async () => {
-      await saveBeautifyBinding(name);
-      closeModalOverlay(overlay);
-    });
-    list.append(item);
+  bindings.beautify.items.unshift({
+    id: makeBindingId(),
+    themeName: normalized,
+    createdAt: new Date().toISOString(),
   });
-
-  overlay.addEventListener('click', event => {
-    if (event.target.closest('[data-action="cancel"]')) closeModalOverlay(overlay);
-  });
-  mountModalOverlay(overlay);
+  const saved = await saveCurrentCharacterBindings(bindings);
+  if (saved) notify('success', `已添加美化：${normalized}`);
+  return saved;
 }
 
 function requestCharacterRelationConfirmation(title, message, confirmLabel) {
@@ -2276,6 +2353,103 @@ async function confirmRemoveRelatedCharacter(avatar, fallbackName = '') {
   if (confirmed) await removeCharacterFromRelationGroup(avatar);
 }
 
+function openCharacterTransferModal(sourceAvatar, targetAvatar, fallbackName = '') {
+  const source = findCharacterByAvatar(sourceAvatar);
+  const target = findCharacterByAvatar(targetAvatar);
+  if (!source || !target) {
+    notify('warning', `找不到角色卡：${fallbackName || targetAvatar}`);
+    return;
+  }
+  const sourceBindings = normalizeCharacterBindings(source.character?.data?.extensions?.[EXTENSION_KEY]);
+  const counts = getCharacterTransferCounts(sourceBindings);
+  const options = [
+    { type: 'beautify', icon: 'fa-palette', label: '美化', detail: '复制已添加的美化', unit: '项' },
+    { type: 'presets', icon: 'fa-sliders', label: '预设', detail: '复制预设与条目顺序', unit: '项' },
+    { type: 'worldBooks', icon: 'fa-book-atlas', label: '世界书', detail: '仅复制非角色绑定世界书的条目', unit: '条' },
+    { type: 'users', icon: 'fa-user', label: 'user 信息', detail: '复制 user 名称与头像绑定', unit: '项' },
+  ];
+
+  const existing = document.querySelector('#tac-binding-modal');
+  if (existing) closeModalOverlay(existing);
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-binding-modal';
+  overlay.className = 'tac-character-transfer-modal';
+  trapModalEvents(overlay);
+  overlay.innerHTML = `
+    <div class="tac-modal-card tac-character-transfer-card">
+      <div class="tac-modal-head">
+        <div>
+          <div class="tac-modal-kicker">角色卡关联已添加</div>
+          <div class="tac-modal-title">转移内容到 <span></span></div>
+        </div>
+        <button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <div class="tac-character-transfer-body">
+        <p>选择要复制到关联角色卡的内容。目标卡已有内容会保留，相同内容不会重复添加。</p>
+        <div class="tac-character-transfer-grid"></div>
+      </div>
+      <div class="tac-modal-actions">
+        <button type="button" class="menu_button" data-action="cancel">暂不转移</button>
+        <button type="button" class="menu_button" data-action="confirm" disabled>转移所选</button>
+      </div>
+    </div>
+  `;
+  overlay.querySelector('.tac-modal-title span').textContent = target.name;
+  const grid = overlay.querySelector('.tac-character-transfer-grid');
+  options.forEach(option => {
+    const count = counts[option.type];
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tac-character-transfer-option';
+    button.dataset.transferType = option.type;
+    button.disabled = !count;
+    button.setAttribute('aria-pressed', 'false');
+    button.innerHTML = `
+      <span class="tac-character-transfer-icon"><i class="fa-solid ${option.icon}"></i></span>
+      <span class="tac-character-transfer-copy">
+        <strong></strong>
+        <small></small>
+      </span>
+      <span class="tac-character-transfer-count"></span>
+      <i class="fa-solid fa-check tac-character-transfer-check"></i>
+    `;
+    button.querySelector('strong').textContent = option.label;
+    button.querySelector('small').textContent = count ? option.detail : '当前角色卡没有可转移内容';
+    button.querySelector('.tac-character-transfer-count').textContent = `${count} ${option.unit}`;
+    grid.append(button);
+  });
+
+  const selected = new Set();
+  const confirm = overlay.querySelector('[data-action="confirm"]');
+  grid.addEventListener('click', event => {
+    const button = event.target.closest('.tac-character-transfer-option');
+    if (!button || button.disabled) return;
+    const type = button.dataset.transferType;
+    if (selected.has(type)) selected.delete(type);
+    else selected.add(type);
+    const active = selected.has(type);
+    button.classList.toggle('is-selected', active);
+    button.setAttribute('aria-pressed', String(active));
+    confirm.disabled = !selected.size;
+  });
+  overlay.addEventListener('click', async event => {
+    if (event.target.closest('[data-action="cancel"]')) {
+      closeModalOverlay(overlay);
+      return;
+    }
+    if (!event.target.closest('[data-action="confirm"]') || !selected.size) return;
+    confirm.disabled = true;
+    confirm.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i><span>转移中</span>';
+    const transferred = await transferCharacterBindingContent(sourceAvatar, targetAvatar, Array.from(selected));
+    if (transferred) closeModalOverlay(overlay);
+    else {
+      confirm.disabled = false;
+      confirm.textContent = '重试转移';
+    }
+  });
+  mountModalOverlay(overlay);
+}
+
 function openCharacterLibraryPicker() {
   const { character } = getCurrentCharacterContext();
   const currentAvatar = normalizeTag(character?.avatar);
@@ -2324,8 +2498,10 @@ function openCharacterLibraryPicker() {
     button.querySelector('span').textContent = candidate.name;
     button.addEventListener('click', async () => {
       button.disabled = true;
-      if (await addCharacterToRelationGroup(candidate.avatar)) closeModalOverlay(overlay);
-      else button.disabled = false;
+      if (await addCharacterToRelationGroup(candidate.avatar)) {
+        closeModalOverlay(overlay);
+        openCharacterTransferModal(currentAvatar, candidate.avatar, candidate.name);
+      } else button.disabled = false;
     });
     grid.append(button);
   });
@@ -2420,8 +2596,6 @@ async function applyWorldBookBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
   const books = Array.isArray(binding.books) ? binding.books : [];
   const targetGlobalBooks = uniqueTags(binding.globalBooks ?? books.map(book => book.name));
-  const targetPrimary = normalizeTag(binding.characterBooks?.primary);
-  const targetAdditional = uniqueTags(binding.characterBooks?.additional);
   let contentChanged = false;
 
   try {
@@ -2442,6 +2616,12 @@ async function applyWorldBookBinding(binding, { automatic = false } = {}) {
 
     const { id, character } = getCurrentCharacterContext();
     const currentCharacterBooks = getCurrentCharacterWorldBookSelection();
+    const targetPrimary = binding.preserveCharacterBooks
+      ? currentCharacterBooks.primary
+      : normalizeTag(binding.characterBooks?.primary);
+    const targetAdditional = binding.preserveCharacterBooks
+      ? currentCharacterBooks.additional
+      : uniqueTags(binding.characterBooks?.additional);
     const primaryChanged = Boolean(character) && currentCharacterBooks.primary !== targetPrimary;
     const additionalChanged = Boolean(character)
       && !stringSetsMatch(currentCharacterBooks.additional, targetAdditional);
@@ -2463,7 +2643,7 @@ async function deleteCharacterBinding(type, id) {
   const bucket = bindings[type];
   if (!bucket?.items) return;
   const item = bucket.items.find(entry => entry.id === id);
-  const confirmed = await requestDeleteBindingConfirmation(type, item?.name || '');
+  const confirmed = await requestDeleteBindingConfirmation(type, item?.name || item?.themeName || '');
   if (!confirmed) return;
   bucket.items = bucket.items.filter(item => item.id !== id);
   if (bucket.starredId === id) bucket.starredId = '';
@@ -2498,7 +2678,7 @@ function requestDeleteBindingConfirmation(type, name) {
         </div>
       </div>
     `;
-    const titles = { presets: '删除预设绑定', users: '删除 user 绑定', worldBooks: '删除世界书绑定' };
+    const titles = { beautify: '删除美化绑定', presets: '删除预设绑定', users: '删除 user 绑定', worldBooks: '删除世界书绑定' };
     overlay.querySelector('.tac-modal-title').textContent = titles[type] || '删除绑定';
     overlay.querySelector('.tac-confirm-body').textContent = name ? `确定删除“${name}”？` : '确定删除这条绑定？';
 
@@ -2627,8 +2807,9 @@ async function applyStarredCharacterBindings() {
   state.lastAppliedCharacterBindingKey = key;
   try {
     const bindings = getCurrentCharacterBindings();
-    if (bindings.beautify.themeName) {
-      applyBeautifyBinding(bindings.beautify.themeName, { automatic: true });
+    const beautify = bindings.beautify.items.find(item => item.id === bindings.beautify.starredId);
+    if (beautify) {
+      applyBeautifyBinding(beautify.themeName, { automatic: true });
       await new Promise(resolve => setTimeout(resolve, 120));
     }
     const preset = bindings.presets.items.find(item => item.id === bindings.presets.starredId);
@@ -3029,6 +3210,43 @@ function makeBindingListItem(type, item, starredId) {
   return row;
 }
 
+function makeBeautifyBindingListItem(item, starredId) {
+  const row = document.createElement('div');
+  const isStarred = starredId === item.id;
+  row.className = `tac-binding-item tac-beautify-binding-item${isStarred ? ' is-starred' : ''}`;
+  row.dataset.searchText = `${item.themeName} 美化`.toLocaleLowerCase('zh-Hans-CN');
+
+  const main = document.createElement('div');
+  main.className = 'tac-binding-item-main';
+  const title = document.createElement('div');
+  title.className = 'tac-binding-item-title';
+  title.textContent = item.themeName;
+  main.append(title);
+  if (normalizeThemeNameKey(item.themeName) === normalizeThemeNameKey(getCurrentThemeName())) {
+    const meta = document.createElement('div');
+    meta.className = 'tac-binding-item-meta';
+    meta.textContent = '当前正在使用';
+    main.append(meta);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'tac-binding-item-actions';
+  const star = makeBindingButton(
+    isStarred ? 'fa-star' : 'fa-regular fa-star',
+    isStarred ? '取消自动加载' : '标为自动加载',
+    () => starCharacterBinding('beautify', item.id),
+    `tac-binding-star${isStarred ? ' is-active' : ''}`,
+  );
+  star.setAttribute('aria-pressed', String(isStarred));
+  actions.append(
+    star,
+    makeBindingButton('fa-right-to-bracket', '应用美化', () => applyBeautifyBinding(item.themeName)),
+    makeBindingButton('fa-trash', '删除美化绑定', () => deleteCharacterBinding('beautify', item.id)),
+  );
+  row.append(main, actions);
+  return row;
+}
+
 function applyCharacterBindingSearch(root, query) {
   const normalized = normalizeTag(query).toLocaleLowerCase('zh-Hans-CN');
   root.querySelectorAll('.tac-binding-list').forEach(list => {
@@ -3070,21 +3288,24 @@ function renderBeautifyBindingModule(bindings) {
   const section = document.createElement('section');
   section.className = 'tac-binding-module tac-beautify-binding-module';
   section.innerHTML = `
-    <div class="tac-binding-module-head tac-beautify-binding-head">
+    <div class="tac-binding-module-head">
       <div class="tac-binding-module-title"><i class="fa-solid fa-palette"></i> 美化绑定</div>
-      <div class="tac-binding-button-row">
-        <button type="button" class="menu_button" data-action="choose" title="选择美化"><i class="fa-solid fa-list"></i><span>选择</span></button>
-        <button type="button" class="menu_button" data-action="save-current" title="保存当前美化"><i class="fa-solid fa-floppy-disk"></i><span>当前</span></button>
-        <button type="button" class="menu_button" data-action="clear" title="取消绑定"><i class="fa-solid fa-link-slash"></i><span>取消</span></button>
-      </div>
+      <button type="button" class="menu_button tac-binding-save" data-action="add" title="添加当前美化"><i class="fa-solid fa-plus"></i><span>添加</span></button>
     </div>
-    <div class="tac-binding-current"></div>
+    <div class="tac-binding-list"></div>
   `;
-  const current = section.querySelector('.tac-binding-current');
-  current.textContent = bindings.beautify.themeName ? `当前绑定：${bindings.beautify.themeName}` : '当前未绑定角色卡美化。';
-  section.querySelector('[data-action="save-current"]')?.addEventListener('click', () => saveBeautifyBinding(getCurrentThemeName()));
-  section.querySelector('[data-action="choose"]')?.addEventListener('click', openBeautifyBindingPicker);
-  section.querySelector('[data-action="clear"]')?.addEventListener('click', clearBeautifyBinding);
+  section.querySelector('[data-action="add"]')?.addEventListener('click', () => saveBeautifyBinding(getCurrentThemeName()));
+  const list = section.querySelector('.tac-binding-list');
+  if (bindings.beautify.items.length) {
+    bindings.beautify.items.forEach(item => list.append(makeBeautifyBindingListItem(item, bindings.beautify.starredId)));
+    const empty = document.createElement('div');
+    empty.className = 'tac-binding-empty tac-binding-search-empty';
+    empty.textContent = '没有匹配的美化绑定。';
+    empty.hidden = true;
+    list.append(empty);
+  } else {
+    list.innerHTML = '<div class="tac-binding-empty">还没有添加美化绑定。</div>';
+  }
   return section;
 }
 
