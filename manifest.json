@@ -4,9 +4,8 @@
   "requires": [],
   "optional": [],
   "js": "index.js",
-  "css": "style.css",
   "author": "glo",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "homePage": "",
   "description": "Classifies SillyTavern UI theme files with style, topic, color, and avatar tags."
 }

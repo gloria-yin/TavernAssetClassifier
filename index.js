@@ -1,10 +1,4 @@
-import { eventSource, event_types, getRequestHeaders, getThumbnailUrl, name1, saveSettingsDebounced, selectCharacterById, setUserAvatar, setUserName, unshallowCharacter, user_avatar } from '../../../../script.js';
-import { getContext, writeExtensionField } from '../../../../scripts/extensions.js';
-import { background_settings, getBackgroundPath } from '../../../../scripts/backgrounds.js';
-import { promptManager } from '../../../../scripts/openai.js';
-import { getThemeObject, power_user } from '../../../../scripts/power-user.js';
-import { charSetAuxWorlds, getWorldInfoSettings, loadWorldInfo, saveWorldInfo, selected_world_info, updateWorldInfoList, updateWorldInfoSettings, world_info } from '../../../../scripts/world-info.js';
-import { getCharaFilename } from '../../../../scripts/utils.js';
+import { host, getContext, getRequestHeaders, getThumbnailUrl, saveSettingsDebounced, selectCharacterById, setUserAvatar, setUserName, unshallowCharacter, writeExtensionField, getBackgroundPath, getThemeObject, charSetAuxWorlds, getWorldInfoSettings, loadWorldInfo, saveWorldInfo, updateWorldInfoList, updateWorldInfoSettings, getCharaFilename } from './host.js';
 
 const EXTENSION_KEY = 'tavernAssetClassifier';
 const COLOR_TAGS = [
@@ -51,6 +45,15 @@ const state = {
   characterRelationDeleteMode: false,
   applyingCharacterBinding: false,
   lastAppliedCharacterBindingKey: '',
+  characterBindingApplyPending: false,
+  promptOrderSavePending: false,
+  featureMountTimer: null,
+  started: false,
+  starting: null,
+  stylePromise: null,
+  boundEvents: [],
+  themeSelect: null,
+  lastMountError: '',
 };
 
 function notify(type, message) {
@@ -101,12 +104,15 @@ function mountModalOverlay(overlay) {
 function getSettings(create = true) {
   const context = getContext();
   const root = context.extensionSettings ?? context.extension_settings;
-  if (!root || typeof root !== 'object') return null;
-  if (!root[EXTENSION_KEY] && create) {
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return null;
+  if (root[EXTENSION_KEY] == null && create) {
     root[EXTENSION_KEY] = { files: {} };
   }
   const settings = root[EXTENSION_KEY];
-  if (!settings.files || typeof settings.files !== 'object') settings.files = {};
+  if (settings == null) return null;
+  if (typeof settings !== 'object' || Array.isArray(settings)) throw new Error('分类器配置格式异常，已保留原数据，请先备份后检查。');
+  if (settings.files == null) settings.files = {};
+  if (typeof settings.files !== 'object' || Array.isArray(settings.files)) throw new Error('分类器标签配置格式异常，已保留原数据，请先备份后检查。');
   return settings;
 }
 
@@ -208,7 +214,9 @@ function cloneData(value) {
 
 function dataMatches(left, right) {
   try {
-    return JSON.stringify(left) === JSON.stringify(right);
+    const ordered = (_key, value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value;
+    return JSON.stringify(left, ordered) === JSON.stringify(right, ordered);
   } catch {
     return false;
   }
@@ -331,12 +339,12 @@ async function saveCurrentCharacterBindings(bindings) {
   }
   const normalized = normalizeCharacterBindings(bindings);
   try {
-    await writeExtensionField(id, EXTENSION_KEY, normalized);
+    await writeVerifiedExtensionField(id, EXTENSION_KEY, normalized);
     scheduleCharacterBindingRender();
     return true;
   } catch (error) {
     console.error('TavernAssetClassifier: failed to save character bindings', error);
-    notify('error', '保存角色绑定失败，请检查控制台。');
+    notify('error', `角色绑定未确认保存，请核对后重试：${error.message}`);
     return false;
   }
 }
@@ -388,7 +396,7 @@ async function synchronizeCharacterRelationGroup(members) {
     if (!loaded) continue;
     const bindings = normalizeCharacterBindings(loaded.character?.data?.extensions?.[EXTENSION_KEY]);
     bindings.relatedCharacters = references.filter(item => item.avatar !== loaded.avatar);
-    await writeExtensionField(loaded.id, EXTENSION_KEY, bindings);
+    await writeVerifiedExtensionField(loaded.id, EXTENSION_KEY, bindings);
   }
 }
 
@@ -421,7 +429,7 @@ async function removeCharacterFromRelationGroup(targetAvatar) {
     if (removed) {
       const bindings = normalizeCharacterBindings(removed.character?.data?.extensions?.[EXTENSION_KEY]);
       bindings.relatedCharacters = [];
-      await writeExtensionField(removed.id, EXTENSION_KEY, bindings);
+      await writeVerifiedExtensionField(removed.id, EXTENSION_KEY, bindings);
     }
     notify('success', '已从关联集合中移除角色卡。');
     scheduleCharacterBindingRender();
@@ -533,7 +541,7 @@ async function transferCharacterBindingContent(sourceAvatar, targetAvatar, selec
       );
     }
 
-    await writeExtensionField(target.id, EXTENSION_KEY, normalizeCharacterBindings(targetBindings));
+    await writeVerifiedExtensionField(target.id, EXTENSION_KEY, normalizeCharacterBindings(targetBindings));
     scheduleCharacterBindingRender();
     const total = Object.values(transferredCounts).reduce((sum, count) => sum + count, 0);
     notify('success', total ? `已将所选内容转移到“${target.name}”。` : `“${target.name}”中已有相同内容，无需重复转移。`);
@@ -546,7 +554,13 @@ async function transferCharacterBindingContent(sourceAvatar, targetAvatar, selec
 }
 
 function getCurrentPromptPresetSelect() {
+  const activeSelector = {
+    openai: '#settings_preset_openai',
+    textgenerationwebui: '#settings_preset_textgenerationwebui',
+    novel: '#settings_preset_novel',
+  }[host.main_api];
   const preferredSelectors = [
+    ...(activeSelector ? [activeSelector] : []),
     '#settings_preset_openai',
     '#settings_preset_textgenerationwebui',
     '#settings_preset_novel',
@@ -563,7 +577,7 @@ function getCurrentPromptPresetSelect() {
 
 function getCurrentThemeName() {
   const select = getThemeSelect();
-  if (!select) return String(power_user.theme || '').trim();
+  if (!select) return String(host.power_user.theme || '').trim();
 
   const selectedValue = String(select.value || '').trim();
   if (selectedValue && Array.from(select.options).some(option => option.value === selectedValue)) {
@@ -573,7 +587,7 @@ function getCurrentThemeName() {
   const selectedOptionValue = String(select.selectedOptions?.[0]?.value || '').trim();
   if (selectedOptionValue) return selectedOptionValue;
 
-  return String(select.options?.[0]?.value || power_user.theme || '').trim();
+  return String(select.options?.[0]?.value || host.power_user.theme || '').trim();
 }
 
 function getThemeRecord(name, create = true) {
@@ -1081,8 +1095,8 @@ function applyBackgroundFile(filename) {
   const url = getBackgroundCssUrl(normalized);
   if (!url) return false;
   document.querySelector('#bg1')?.style.setProperty('background-image', url);
-  background_settings.name = normalized;
-  background_settings.url = url;
+  host.background_settings.name = normalized;
+  host.background_settings.url = url;
   return true;
 }
 
@@ -1095,7 +1109,7 @@ function applyBoundBackgroundForTheme(themeName = getCurrentThemeName()) {
 }
 
 function syncBoundBackgroundForCurrentTheme(force = false) {
-  const themeName = normalizeTag(power_user.theme) || getCurrentThemeName();
+  const themeName = normalizeTag(host.power_user.theme) || getCurrentThemeName();
   if (!themeName) return;
   if (!force && state.lastThemeBackgroundSyncName === themeName) return;
   const applied = applyBoundBackgroundForTheme(themeName);
@@ -1105,7 +1119,7 @@ function syncBoundBackgroundForCurrentTheme(force = false) {
 function startThemeBackgroundSync() {
   if (state.themeBackgroundSyncBound) return;
   state.themeBackgroundSyncBound = true;
-  eventSource?.on?.(event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
+  if (host.event_types.SETTINGS_UPDATED) host.eventSource?.on?.(host.event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
   state.themeBackgroundSyncTimer = setInterval(() => syncBoundBackgroundForCurrentTheme(), 3000);
 }
 
@@ -1115,7 +1129,7 @@ function stopThemeBackgroundSync() {
     state.themeBackgroundSyncTimer = null;
   }
   if (state.themeBackgroundSyncBound) {
-    eventSource?.removeListener?.(event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
+    if (host.event_types.SETTINGS_UPDATED) host.eventSource?.removeListener?.(host.event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
     state.themeBackgroundSyncBound = false;
   }
   state.lastThemeBackgroundSyncName = '';
@@ -1307,7 +1321,7 @@ function applyThemeFilterToSelect() {
   if (!state.allThemeOptions.length) snapshotThemeOptions();
   if (!state.allThemeOptions.length) return;
 
-  const previousValue = String(select.value || power_user.theme || '').trim();
+  const previousValue = String(select.value || host.power_user.theme || '').trim();
   const visibleNames = new Set(getFilteredThemeNames());
   const orderedOptions = getOrderedThemeOptions();
   const hasFilter = state.selectedFilters.length || normalizeTag(state.themeSearchQuery);
@@ -2047,7 +2061,7 @@ async function renameCurrentTheme() {
         : JSON.parse(JSON.stringify(settings.files[oldName]));
     }
     sanitizeStoredThemeNameTags();
-    power_user.theme = nextName;
+    host.power_user.theme = nextName;
     saveSettings();
     applyThemeFilterToSelect();
     const select = getThemeSelect();
@@ -2080,6 +2094,7 @@ function getCurrentPromptPresetValue() {
 }
 
 function getPresetBindingDisplayName(binding) {
+  if (normalizeTag(binding?.presetName)) return normalizeTag(binding.presetName);
   const select = getCurrentPromptPresetSelect();
   if (binding?.presetValue && select) {
     const option = Array.from(select.options).find(item => item.value === binding.presetValue);
@@ -2090,9 +2105,10 @@ function getPresetBindingDisplayName(binding) {
 
 
 function getCurrentPromptOrderSnapshot() {
-  const manager = promptManager;
+  if (host.main_api !== 'openai') return [];
+  const manager = host.promptManager;
   const character = manager?.activeCharacter;
-  if (!manager?.getPromptOrderForCharacter || !character) return [];
+  if (!manager?.getPromptOrderForCharacter || !character) throw new Error('预设条目管理器尚未就绪，请先打开聊天补全预设后重试。');
   return cloneData(manager.getPromptOrderForCharacter(character));
 }
 
@@ -2112,15 +2128,15 @@ function captureUserBinding(name) {
     id: makeBindingId(),
     name,
     createdAt: new Date().toISOString(),
-    avatar: normalizeTag(user_avatar),
-    userName: normalizeTag(name1),
+    avatar: normalizeTag(host.user_avatar),
+    userName: normalizeTag(host.name1),
   };
 }
 
 function getCurrentCharacterWorldBookSelection() {
   const { id, character } = getCurrentCharacterContext();
   const fileName = character ? getCharaFilename(id) : '';
-  const extra = world_info?.charLore?.find(item => item?.name === fileName);
+  const extra = host.world_info?.charLore?.find(item => item?.name === fileName);
   return {
     fileName: normalizeTag(fileName),
     primary: normalizeTag(character?.data?.extensions?.world),
@@ -2141,7 +2157,8 @@ function getWorldBookBindingSummary(binding) {
 }
 
 async function captureWorldBookBinding(name) {
-  const globalBooks = uniqueTags(selected_world_info);
+  const characterKey = getCurrentCharacterKey();
+  const globalBooks = uniqueTags(host.selected_world_info);
   const characterSelection = getCurrentCharacterWorldBookSelection();
   const characterBooks = {
     primary: characterSelection.primary,
@@ -2151,6 +2168,7 @@ async function captureWorldBookBinding(name) {
   const books = [];
   for (const bookName of bookNames) {
     const data = await loadWorldInfo(bookName);
+    assertCharacterContext(characterKey);
     if (!data) throw new Error(`failed to load world book: ${bookName}`);
     books.push({ name: bookName, data: cloneData(data) });
   }
@@ -2222,6 +2240,7 @@ async function requestBindingName(title, defaultValue) {
 }
 
 async function savePresetBinding() {
+  const characterKey = getCurrentCharacterKey();
   const presetName = getCurrentPromptPresetName();
   if (!presetName) {
     notify('info', '当前没有可保存的预设。');
@@ -2229,31 +2248,37 @@ async function savePresetBinding() {
   }
   const name = await requestBindingName('预设绑定名称', presetName);
   if (!name) return;
+  assertCharacterContext(characterKey);
   const bindings = getCurrentCharacterBindings();
   bindings.presets.items.unshift(capturePresetBinding(name));
   if (await saveCurrentCharacterBindings(bindings)) notify('success', '预设绑定已保存到当前角色卡。');
 }
 
 async function saveUserBinding() {
-  const name = await requestBindingName('user 绑定名称', normalizeTag(name1) || '当前 user');
+  const characterKey = getCurrentCharacterKey();
+  const name = await requestBindingName('user 绑定名称', normalizeTag(host.name1) || '当前 user');
   if (!name) return;
+  assertCharacterContext(characterKey);
   const bindings = getCurrentCharacterBindings();
   bindings.users.items.unshift(captureUserBinding(name));
   if (await saveCurrentCharacterBindings(bindings)) notify('success', 'user 绑定已保存到当前角色卡。');
 }
 
 async function saveWorldBookBinding() {
+  const characterKey = getCurrentCharacterKey();
   const characterSelection = getCurrentCharacterWorldBookSelection();
   const currentNames = uniqueTags([
-    ...selected_world_info,
+    ...host.selected_world_info,
     characterSelection.primary,
     ...characterSelection.additional,
   ]);
   const defaultName = currentNames.length ? currentNames.join(' + ') : '无世界书';
   const name = await requestBindingName('世界书绑定名称', defaultName);
   if (!name) return;
+  assertCharacterContext(characterKey);
   try {
     const snapshot = await captureWorldBookBinding(name);
+    assertCharacterContext(characterKey);
     const bindings = getCurrentCharacterBindings();
     bindings.worldBooks.items.unshift(snapshot);
     if (await saveCurrentCharacterBindings(bindings)) {
@@ -2520,58 +2545,63 @@ function openCharacterLibraryPicker() {
 
 async function applyPresetBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
+  const characterKey = getCurrentCharacterKey();
   const select = getCurrentPromptPresetSelect();
-  const matchedOption = select ? Array.from(select.options).find(option => (
-    (binding.presetValue && option.value === binding.presetValue)
-      || (binding.presetName && normalizeTag(option.textContent) === binding.presetName)
-      || (binding.presetName && option.value === binding.presetName)
-  )) : null;
+  const options = Array.from(select?.options ?? []);
+  const presetName = normalizeTag(binding.presetName);
+  // Numeric option values can change when the host rebuilds its preset list.
+  const matchedOption = presetName
+    ? options.find(option => normalizeTag(option.textContent) === presetName || option.value === presetName)
+    : options.find(option => binding.presetValue && option.value === binding.presetValue);
+  if (!matchedOption && (binding.presetName || binding.presetValue)) throw new Error(`找不到预设：${getPresetBindingDisplayName(binding)}`);
+  const hasPromptOrder = Array.isArray(binding.promptOrder) && binding.promptOrder.length > 0;
+  if (hasPromptOrder) requirePromptOrderManager();
   const presetNeedsChange = Boolean(matchedOption && select?.value !== matchedOption.value);
-  const promptOrderNeedsChange = Boolean(
-    Array.isArray(binding.promptOrder)
-      && binding.promptOrder.length
-      && !dataMatches(getCurrentPromptOrderSnapshot(), binding.promptOrder),
-  );
   if (presetNeedsChange) {
-    select.value = matchedOption.value;
-    const jquery = window.jQuery || window.$;
-    if (jquery) {
-      jquery(select).trigger('change');
-    } else {
-      select.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    await new Promise(resolve => setTimeout(resolve, 350));
-  } else if (!matchedOption && (binding.presetName || binding.presetValue) && !automatic) {
-    notify('warning', `找不到预设：${getPresetBindingDisplayName(binding)}`);
+    await changePromptPreset(select, matchedOption);
   }
+  assertCharacterContext(characterKey);
 
-  const manager = promptManager;
+  const manager = host.promptManager;
   const character = manager?.activeCharacter;
-  if (promptOrderNeedsChange && character && manager?.removePromptOrderForCharacter && manager?.addPromptOrderForCharacter) {
+  const promptOrderNeedsChange = Boolean(hasPromptOrder && !dataMatches(getCurrentPromptOrderSnapshot(), binding.promptOrder));
+  if (promptOrderNeedsChange) {
+    requirePromptOrderManager();
+    state.promptOrderSavePending = true;
     manager.removePromptOrderForCharacter(character);
     manager.addPromptOrderForCharacter(character, cloneData(binding.promptOrder));
-    manager.saveServiceSettings?.();
-    manager.render?.(false);
+  }
+  const promptOrderNeedsSave = hasPromptOrder && state.promptOrderSavePending;
+  if (promptOrderNeedsSave) {
+    await savePromptOrderSettings(requirePromptOrderManager());
+    assertCharacterContext(characterKey);
+    await manager.render(false);
+    if (!dataMatches(getCurrentPromptOrderSnapshot(), binding.promptOrder)) throw new Error('未确认预设条目顺序已应用，请重新读取后重试。');
   }
 
-  const changed = presetNeedsChange || promptOrderNeedsChange;
+  const changed = presetNeedsChange || promptOrderNeedsChange || promptOrderNeedsSave;
   if (!automatic) notify('success', changed ? `已应用预设绑定：${binding.name}` : '当前预设和条目顺序已经一致。');
   return changed;
 }
 
 async function applyUserBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
-  const avatarNeedsChange = Boolean(binding.avatar && binding.avatar !== normalizeTag(user_avatar));
-  const nameNeedsChange = Boolean(binding.userName && binding.userName !== normalizeTag(name1));
-  if (avatarNeedsChange && power_user.personas?.[binding.avatar]) {
+  const characterKey = getCurrentCharacterKey();
+  const avatarNeedsChange = Boolean(binding.avatar && binding.avatar !== normalizeTag(host.user_avatar));
+  const nameNeedsChange = Boolean(binding.userName && binding.userName !== normalizeTag(host.name1));
+  if (avatarNeedsChange && !host.power_user.personas?.[binding.avatar]) throw new Error(`找不到 user 头像：${binding.avatar}`);
+  host.require([...(avatarNeedsChange ? ['setUserAvatar'] : []), ...(binding.userName ? ['setUserName'] : [])]);
+  if (avatarNeedsChange) {
     await setUserAvatar(binding.avatar, { toastPersonaNameChange: !automatic, navigateToCurrent: false });
-  } else if (avatarNeedsChange && !automatic) {
-    notify('warning', `找不到 user 头像：${binding.avatar}`);
   }
-  if (nameNeedsChange) {
-    setUserName(binding.userName, { toastPersonaNameChange: !automatic });
+  assertCharacterContext(characterKey);
+  if (binding.userName && normalizeTag(host.name1) !== binding.userName) {
+    await setUserName(binding.userName, { toastPersonaNameChange: !automatic });
   }
-  const changed = (avatarNeedsChange && Boolean(power_user.personas?.[binding.avatar])) || nameNeedsChange;
+  assertCharacterContext(characterKey);
+  if ((avatarNeedsChange && normalizeTag(host.user_avatar) !== binding.avatar)
+    || (binding.userName && normalizeTag(host.name1) !== binding.userName)) throw new Error('未确认 user 名称或头像已切换，请重新读取后重试。');
+  const changed = (avatarNeedsChange && Boolean(host.power_user.personas?.[binding.avatar])) || nameNeedsChange;
   if (!automatic) notify('success', changed ? `已应用 user 绑定：${binding.name}` : '当前 user 已与绑定一致。');
   return changed;
 }
@@ -2580,10 +2610,9 @@ function applyBeautifyBinding(themeName, { automatic = false } = {}) {
   const normalized = normalizeTag(themeName);
   if (!normalized) return false;
   if (!getThemeNames().includes(normalized)) {
-    if (!automatic) notify('warning', `找不到美化：${normalized}`);
-    return false;
+    throw new Error(`找不到美化：${normalized}`);
   }
-  if (normalizeTag(power_user.theme || getCurrentThemeName()) === normalized) {
+  if (normalizeTag(host.power_user.theme || getCurrentThemeName()) === normalized) {
     if (!automatic) notify('success', '当前美化已与绑定一致。');
     return false;
   }
@@ -2594,25 +2623,42 @@ function applyBeautifyBinding(themeName, { automatic = false } = {}) {
 
 async function applyWorldBookBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
+  const characterKey = getCurrentCharacterKey();
   const books = Array.isArray(binding.books) ? binding.books : [];
   const targetGlobalBooks = uniqueTags(binding.globalBooks ?? books.map(book => book.name));
   let contentChanged = false;
 
   try {
+    host.require(['loadWorldInfo', 'saveWorldInfo', 'getWorldInfoSettings', 'updateWorldInfoSettings', 'updateWorldInfoList', 'writeExtensionField', 'charSetAuxWorlds']);
+    getCurrentCharacterWorldBookSelection();
+    const beforeGlobalBooks = [...host.selected_world_info];
+    if (books.some(book => !book?.name || !book.data?.entries || typeof book.data.entries !== 'object')) throw new Error('世界书绑定数据不完整，未应用。');
     for (const book of books) {
       const current = await loadWorldInfo(book.name);
-      if (dataMatches(current, book.data)) continue;
+      assertCharacterContext(characterKey);
+      if (dataMatches(current, book.data)) {
+        // Native saves update the memory cache even when the disk write fails.
+        const persisted = await readSavedWorldBook(book.name, { allowMissing: true });
+        assertCharacterContext(characterKey);
+        if (dataMatches(persisted, book.data)) continue;
+      }
       await saveWorldInfo(book.name, cloneData(book.data), true);
+      assertCharacterContext(characterKey);
+      const persisted = await readSavedWorldBook(book.name);
+      assertCharacterContext(characterKey);
+      if (!dataMatches(persisted, book.data)) throw new Error(`未确认世界书已完整保存：${book.name}`);
       contentChanged = true;
     }
 
-    const globalSelectionChanged = !stringSetsMatch(selected_world_info, targetGlobalBooks);
+    const globalSelectionChanged = !stringSetsMatch(beforeGlobalBooks, targetGlobalBooks);
     if (globalSelectionChanged) {
       updateWorldInfoSettings(cloneData(getWorldInfoSettings()), targetGlobalBooks);
     }
     if (contentChanged || globalSelectionChanged) {
       await updateWorldInfoList();
     }
+    assertCharacterContext(characterKey);
+    if (!stringSetsMatch(host.selected_world_info, targetGlobalBooks)) throw new Error('未确认全局世界书挂载已切换。');
 
     const { id, character } = getCurrentCharacterContext();
     const currentCharacterBooks = getCurrentCharacterWorldBookSelection();
@@ -2622,10 +2668,14 @@ async function applyWorldBookBinding(binding, { automatic = false } = {}) {
     const targetAdditional = binding.preserveCharacterBooks
       ? currentCharacterBooks.additional
       : uniqueTags(binding.characterBooks?.additional);
-    const primaryChanged = Boolean(character) && currentCharacterBooks.primary !== targetPrimary;
+    const savedCharacter = character ? await readSavedCharacter(character.avatar) : null;
+    assertCharacterContext(characterKey);
+    const primaryChanged = Boolean(character) && (currentCharacterBooks.primary !== targetPrimary
+      || normalizeTag(savedCharacter?.data?.extensions?.world) !== targetPrimary);
     const additionalChanged = Boolean(character)
       && !stringSetsMatch(currentCharacterBooks.additional, targetAdditional);
-    if (primaryChanged) await writeExtensionField(id, 'world', targetPrimary);
+    if (primaryChanged) await writeVerifiedExtensionField(id, 'world', targetPrimary);
+    assertCharacterContext(characterKey);
     if (additionalChanged) charSetAuxWorlds(currentCharacterBooks.fileName, targetAdditional);
 
     const changed = contentChanged || globalSelectionChanged || primaryChanged || additionalChanged;
@@ -2633,7 +2683,8 @@ async function applyWorldBookBinding(binding, { automatic = false } = {}) {
     return changed;
   } catch (error) {
     console.error('TavernAssetClassifier: failed to apply world books', error);
-    if (!automatic) notify('error', '应用世界书绑定失败，请检查控制台。');
+    if (automatic) throw error;
+    if (!automatic) notify('error', `世界书绑定未完整应用，可能已有部分写入，请核对后重试：${error.message}`);
     return false;
   }
 }
@@ -2767,7 +2818,7 @@ async function updateWorldBookBinding(id) {
   if (!item) return;
   const characterSelection = getCurrentCharacterWorldBookSelection();
   const currentNames = uniqueTags([
-    ...selected_world_info,
+    ...host.selected_world_info,
     characterSelection.primary,
     ...characterSelection.additional,
   ]);
@@ -2800,11 +2851,14 @@ async function starCharacterBinding(type, id) {
 }
 
 async function applyStarredCharacterBindings() {
-  if (state.applyingCharacterBinding) return;
+  if (state.applyingCharacterBinding) {
+    state.characterBindingApplyPending = true;
+    return;
+  }
   const key = getCurrentCharacterKey();
   if (!key || state.lastAppliedCharacterBindingKey === key) return;
   state.applyingCharacterBinding = true;
-  state.lastAppliedCharacterBindingKey = key;
+  state.characterBindingApplyPending = false;
   try {
     const bindings = getCurrentCharacterBindings();
     const beautify = bindings.beautify.items.find(item => item.id === bindings.beautify.starredId);
@@ -2813,14 +2867,20 @@ async function applyStarredCharacterBindings() {
       await new Promise(resolve => setTimeout(resolve, 120));
     }
     const preset = bindings.presets.items.find(item => item.id === bindings.presets.starredId);
+    assertCharacterContext(key);
     if (preset) await applyPresetBinding(preset, { automatic: true });
     const user = bindings.users.items.find(item => item.id === bindings.users.starredId);
+    assertCharacterContext(key);
     if (user) await applyUserBinding(user, { automatic: true });
     const worldBooks = bindings.worldBooks.items.find(item => item.id === bindings.worldBooks.starredId);
+    assertCharacterContext(key);
     if (worldBooks) await applyWorldBookBinding(worldBooks, { automatic: true });
+    assertCharacterContext(key);
+    state.lastAppliedCharacterBindingKey = key;
   } finally {
     state.applyingCharacterBinding = false;
     scheduleCharacterBindingRender();
+    if (state.characterBindingApplyPending || getCurrentCharacterKey() !== key) scheduleCharacterBindingApply();
   }
 }
 
@@ -2828,7 +2888,7 @@ function scheduleCharacterBindingApply(delay = 500) {
   clearTimeout(state.characterBindingTimer);
   state.characterBindingTimer = setTimeout(() => {
     state.characterBindingTimer = null;
-    applyStarredCharacterBindings();
+    void runFeatureTask('自动应用角色绑定', applyStarredCharacterBindings);
   }, delay);
 }
 
@@ -2836,7 +2896,7 @@ function scheduleCharacterBindingRender(delay = 80) {
   clearTimeout(state.characterBindingRenderTimer);
   state.characterBindingRenderTimer = setTimeout(() => {
     state.characterBindingRenderTimer = null;
-    renderCharacterBindingPanel();
+    void runFeatureTask('刷新角色绑定', renderCharacterBindingPanel);
   }, delay);
 }
 
@@ -3007,12 +3067,12 @@ function mountUi() {
   themeBlock.append(details);
 
   getThemeSelect()?.addEventListener('change', () => {
-    setTimeout(() => {
+    setTimeout(() => void runFeatureTask('同步美化配置', () => {
       autoTagCurrentThemeMetadata();
       renderThemePicker();
       scheduleRefresh();
       syncBoundBackgroundForCurrentTheme(true);
-    }, 0);
+    }), 0);
   });
 
   document.querySelector('#ui-preset-delete-button')?.addEventListener('click', () => {
@@ -3039,15 +3099,15 @@ function mountUi() {
 
   scheduleRefresh();
   void autoTagAllThemeMetadata();
-  setTimeout(() => {
+  setTimeout(() => void runFeatureTask('读取美化标签', () => {
     if (autoTagCurrentThemeMetadata()) scheduleRefresh();
-  }, 250);
+  }), 250);
   startThemeBackgroundSync();
   syncBoundBackgroundForCurrentTheme(true);
   return true;
 }
 
-function destroyBeautifyFeature() {
+function destroyBeautifyFeature({ restoreOptions = true } = {}) {
   if (state.refreshTimer) {
     clearTimeout(state.refreshTimer);
     state.refreshTimer = null;
@@ -3057,7 +3117,7 @@ function destroyBeautifyFeature() {
   state.themePickerCleanup?.();
   state.themePickerCleanup = null;
   stopThemeBackgroundSync();
-  restoreThemeSelectOptions();
+  if (restoreOptions) restoreThemeSelectOptions();
   const themeBlock = document.querySelector('#UI-presets-block');
   const actions = document.querySelector('#tac-theme-actions');
   const updateButton = document.querySelector('#ui-preset-update-button');
@@ -3072,17 +3132,6 @@ function destroyBeautifyFeature() {
   getThemeSelect()?.classList.remove('tac-native-theme-select');
   getThemeSelect()?.closest('.tac-theme-picker-row')?.classList.remove('tac-theme-picker-row');
   document.querySelector('#tac-filter-panel')?.remove();
-}
-
-function startBeautifyFeature() {
-  const tryMount = () => {
-    if (mountUi()) {
-      observeThemeOptions();
-      return;
-    }
-    setTimeout(tryMount, 500);
-  };
-  tryMount();
 }
 
 function observeThemeOptions() {
@@ -3135,7 +3184,7 @@ function makeBindingButton(icon, title, onClick, extraClass = '', label = '') {
   button.addEventListener('click', event => {
     event.preventDefault();
     event.stopPropagation();
-    onClick?.();
+    if (onClick) void runFeatureTask(title, onClick);
   });
   return button;
 }
@@ -3269,7 +3318,7 @@ function renderPresetBindingModule(bindings) {
     </div>
     <div class="tac-binding-list"></div>
   `;
-  section.querySelector('.tac-binding-save')?.addEventListener('click', savePresetBinding);
+  section.querySelector('.tac-binding-save')?.addEventListener('click', () => void runFeatureTask('保存预设绑定', savePresetBinding));
   const list = section.querySelector('.tac-binding-list');
   if (bindings.presets.items.length) {
     bindings.presets.items.forEach(item => list.append(makeBindingListItem('presets', item, bindings.presets.starredId)));
@@ -3294,7 +3343,7 @@ function renderBeautifyBindingModule(bindings) {
     </div>
     <div class="tac-binding-list"></div>
   `;
-  section.querySelector('[data-action="add"]')?.addEventListener('click', () => saveBeautifyBinding(getCurrentThemeName()));
+  section.querySelector('[data-action="add"]')?.addEventListener('click', () => void runFeatureTask('保存美化绑定', () => saveBeautifyBinding(getCurrentThemeName())));
   const list = section.querySelector('.tac-binding-list');
   if (bindings.beautify.items.length) {
     bindings.beautify.items.forEach(item => list.append(makeBeautifyBindingListItem(item, bindings.beautify.starredId)));
@@ -3381,7 +3430,7 @@ function renderUserBindingModule(bindings) {
     </div>
     <div class="tac-binding-list"></div>
   `;
-  section.querySelector('.tac-binding-save')?.addEventListener('click', saveUserBinding);
+  section.querySelector('.tac-binding-save')?.addEventListener('click', () => void runFeatureTask('保存 user 绑定', saveUserBinding));
   const list = section.querySelector('.tac-binding-list');
   if (bindings.users.items.length) {
     bindings.users.items.forEach(item => list.append(makeBindingListItem('users', item, bindings.users.starredId)));
@@ -3406,7 +3455,7 @@ function renderWorldBookBindingModule(bindings) {
     </div>
     <div class="tac-binding-list"></div>
   `;
-  section.querySelector('.tac-binding-save')?.addEventListener('click', saveWorldBookBinding);
+  section.querySelector('.tac-binding-save')?.addEventListener('click', () => void runFeatureTask('保存世界书绑定', saveWorldBookBinding));
   const list = section.querySelector('.tac-binding-list');
   if (bindings.worldBooks.items.length) {
     bindings.worldBooks.items.forEach(item => list.append(makeBindingListItem('worldBooks', item, bindings.worldBooks.starredId)));
@@ -3484,7 +3533,6 @@ function renderFeatureSettingsPanel() {
       </div>
     </div>
   `;
-  setTimeout(renderCharacterBindingPanel, 0);
   return panel;
 }
 
@@ -3496,17 +3544,11 @@ function mountFeatureSettingsPanel() {
   }
   const host = getExtensionSettingsHost();
   if (!host) return false;
-  host.append(renderFeatureSettingsPanel());
-  renderCharacterBindingPanel();
+  const panel = renderFeatureSettingsPanel();
+  host.append(panel);
+  try { renderCharacterBindingPanel(); }
+  catch (error) { panel.remove(); throw error; }
   return true;
-}
-
-function startFeatureSettingsPanel() {
-  const tryMount = () => {
-    if (mountFeatureSettingsPanel()) return;
-    setTimeout(tryMount, 500);
-  };
-  tryMount();
 }
 
 function handleCharacterBindingContextChanged() {
@@ -3516,17 +3558,243 @@ function handleCharacterBindingContextChanged() {
   scheduleCharacterBindingApply();
 }
 
-function start() {
-  startFeatureSettingsPanel();
-  startBeautifyFeature();
-  eventSource?.on?.(event_types.APP_READY, handleCharacterBindingContextChanged);
-  eventSource?.on?.(event_types.CHAT_CHANGED, handleCharacterBindingContextChanged);
-  eventSource?.on?.(event_types.CHARACTER_EDITED, scheduleCharacterBindingRender);
-  scheduleCharacterBindingApply(900);
+function retryPendingCharacterBindings() {
+  if (state.lastAppliedCharacterBindingKey !== getCurrentCharacterKey()) scheduleCharacterBindingApply();
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', start, { once: true });
-} else {
-  start();
+function assertCharacterContext(key) {
+  if (getCurrentCharacterKey() !== key) throw new Error('操作期间角色已切换，已停止应用，请在当前角色上重试。');
 }
+
+async function readSavedCharacter(avatar) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch('/api/characters/get', {
+      method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ avatar_url: avatar }), cache: 'no-cache', signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`角色卡保存后读取失败：${avatar}（HTTP ${response.status}）`);
+    const data = await response.json();
+    if (!data?.data?.extensions || typeof data.data.extensions !== 'object') throw new Error(`角色卡保存后返回数据不完整：${avatar}`);
+    return data;
+  } finally { clearTimeout(timer); }
+}
+
+async function writeVerifiedExtensionField(id, key, value) {
+  const avatar = getContext().characters?.[id]?.avatar;
+  if (!avatar) throw new Error('要保存的角色卡已不可用，请重新打开后重试。');
+  await writeExtensionField(id, key, value);
+  const persisted = await readSavedCharacter(avatar);
+  if (!dataMatches(persisted.data.extensions[key], value)) throw new Error(`未确认角色卡字段已完整保存：${avatar} / ${key}`);
+}
+
+async function readSavedWorldBook(name, { allowMissing = false } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch('/api/worldinfo/get', {
+      method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ name }), cache: 'no-cache', signal: controller.signal,
+    });
+    if (allowMissing && response.status === 404) return null;
+    if (!response.ok) throw new Error(`世界书保存后读取失败：${name}（HTTP ${response.status}）`);
+    const data = await response.json();
+    if (!data?.entries || typeof data.entries !== 'object') throw new Error(`世界书保存后返回数据不完整：${name}`);
+    return data;
+  } finally { clearTimeout(timer); }
+}
+
+async function savePromptOrderSettings(manager, timeout = 10000) {
+  state.promptOrderSavePending = true;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => manager.saveServiceSettings()),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('预设条目顺序尚未确认保存，当前更改可能仅在内存中，请检查连接后重试。')), timeout); }),
+    ]);
+    state.promptOrderSavePending = false;
+  } finally { clearTimeout(timer); }
+}
+
+function requirePromptOrderManager() {
+  const manager = host.promptManager;
+  if (!manager?.activeCharacter || ['getPromptOrderForCharacter', 'removePromptOrderForCharacter', 'addPromptOrderForCharacter', 'saveServiceSettings', 'render']
+    .some(name => typeof manager[name] !== 'function')) throw new Error('预设条目管理器尚未就绪，请先打开聊天补全预设后重试。');
+  return manager;
+}
+
+function changePromptPreset(select, option) {
+  return new Promise((resolve, reject) => {
+    const api = host.main_api;
+    const source = host.eventSource, type = api === 'openai' ? host.event_types.OAI_PRESET_CHANGED_AFTER : host.event_types.PRESET_CHANGED;
+    const characterKey = getCurrentCharacterKey();
+    let timer, poll, finished = false;
+    const finish = error => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      if (type) source?.removeListener?.(type, changed);
+      if (error) reject(error);
+      else resolve();
+    };
+    const changed = data => {
+      if (data?.apiId && data.apiId !== api) return;
+      try {
+        assertCharacterContext(characterKey);
+        if (select.value !== option.value) throw new Error('操作期间预设已切换，未继续应用条目顺序，请重试。');
+        finish();
+      } catch (error) { finish(error); }
+    };
+    const hasEvent = Boolean(source?.on && type);
+    timer = setTimeout(() => finish(new Error('等待预设切换完成超时，未继续修改条目顺序，请重新读取后重试。')), 8000);
+    if (hasEvent) source.on(type, changed);
+    else poll = setInterval(() => {
+      try {
+        const name = getContext().chatCompletionSettings?.preset_settings_openai;
+        if (name === normalizeTag(option.textContent) || name === option.value) changed();
+      } catch (error) { finish(error); }
+    }, 100);
+    try {
+      select.value = option.value;
+      const jquery = window.jQuery || window.$;
+      if (jquery) jquery(select).trigger('change');
+      else select.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) { finish(error); }
+  });
+}
+
+async function runFeatureTask(label, task) {
+  try {
+    return await task();
+  } catch (error) {
+    console.error(`TavernAssetClassifier: ${label}`, error);
+    notify('error', `${label}失败：${error?.message || error}`);
+    return false;
+  }
+}
+
+function showStartupStatus(message, failed = false) {
+  let panel = document.querySelector('#tac-startup-status');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'tac-startup-status';
+    panel.className = 'extension_container';
+    panel.setAttribute('role', 'status');
+    panel.style.cssText = 'padding:10px;margin:8px 0;border:1px solid currentColor;border-radius:8px;white-space:normal;';
+  }
+  const container = getExtensionSettingsHost() || document.body;
+  if (panel.parentElement !== container) container.append(panel);
+  if (panel.dataset.message === message && panel.dataset.failed === String(failed)) return;
+  panel.dataset.message = message;
+  panel.dataset.failed = String(failed);
+  const text = document.createElement('div');
+  text.textContent = `ST分类器：${message}`;
+  panel.replaceChildren(text);
+  if (failed) {
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'menu_button';
+    retry.textContent = '重试加载';
+    retry.addEventListener('click', () => {
+      if (state.started) void runFeatureTask('重新加载酒馆接口', async () => { await host.load(); refreshFeatureMounts(); });
+      else void start();
+    });
+    panel.append(retry);
+  }
+}
+
+function loadStyles() {
+  if (state.stylePromise) return state.stylePromise;
+  state.stylePromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById('tac-classifier-style');
+    if (existing?.dataset.loaded === 'true') { resolve(); return; }
+    existing?.remove();
+    const link = document.createElement('link');
+    link.id = 'tac-classifier-style';
+    link.rel = 'stylesheet';
+    link.href = new URL('./style.css', import.meta.url).href;
+    const fail = message => { clearTimeout(timer); link.remove(); reject(new Error(message)); };
+    const timer = setTimeout(() => fail('样式加载超时，请保持酒馆在前台后重试。'), 15000);
+    link.onload = () => { clearTimeout(timer); link.dataset.loaded = 'true'; resolve(); };
+    link.onerror = () => fail('style.css 加载失败，请检查扩展是否安装完整后重试。');
+    document.head.append(link);
+  }).catch(error => { state.stylePromise = null; throw error; });
+  return state.stylePromise;
+}
+
+function refreshFeatureMounts() {
+  const errors = [];
+  let bindingMounted = Boolean(document.querySelector('#tac-extension-settings'));
+  try {
+    if (!bindingMounted) bindingMounted = mountFeatureSettingsPanel();
+  } catch (error) { errors.push(`角色绑定初始化失败：${error.message}`); }
+  const select = getThemeSelect();
+  let themeMounted = Boolean(select && select === state.themeSelect && document.querySelector('#tac-filter-panel'));
+  try {
+    if (!themeMounted && select) {
+      if (state.themeSelect && state.themeSelect !== select) {
+        destroyBeautifyFeature({ restoreOptions: false });
+        state.allThemeOptions = [];
+      }
+      if (mountUi()) {
+        state.themeSelect = select;
+        observeThemeOptions();
+        themeMounted = true;
+      }
+    }
+  } catch (error) { errors.push(`美化分类初始化失败：${error.message}`); }
+  const message = errors.join('；');
+  if (message) {
+    if (message !== state.lastMountError) console.error('TavernAssetClassifier:', message, host.moduleErrors);
+    showStartupStatus(message, true);
+  } else if (host.moduleErrors.length) showStartupStatus(`部分酒馆模块未加载：${host.moduleErrors.map(error => error.path).join('、')}。相关功能可能不可用，请重试。`, true);
+  else if (bindingMounted && themeMounted) document.querySelector('#tac-startup-status')?.remove();
+  else showStartupStatus('已连接酒馆，等待对应设置面板加载。');
+  state.lastMountError = message;
+}
+
+function bindHostEvent(name, handler) {
+  const source = host.eventSource, type = host.event_types[name];
+  if (!source?.on || !type) return;
+  source.on(type, handler);
+  state.boundEvents.push({ source, type, handler });
+}
+
+async function start() {
+  if (state.started) return;
+  if (state.starting) return state.starting;
+  state.starting = (async () => {
+    showStartupStatus('正在加载酒馆接口和样式…');
+    await Promise.all([host.load().then(() => host.ready()), loadStyles()]);
+    if (!getSettings()) throw new Error('酒馆扩展设置尚未就绪，请重试。');
+    state.started = true;
+    bindHostEvent('APP_READY', retryPendingCharacterBindings);
+    bindHostEvent('CHAT_CHANGED', handleCharacterBindingContextChanged);
+    bindHostEvent('CHARACTER_EDITED', scheduleCharacterBindingRender);
+    bindHostEvent('CHAT_COMPLETION_SETTINGS_READY', retryPendingCharacterBindings);
+    bindHostEvent('OAI_PRESET_CHANGED_AFTER', retryPendingCharacterBindings);
+    refreshFeatureMounts();
+    state.featureMountTimer = setInterval(refreshFeatureMounts, 1000);
+    scheduleCharacterBindingApply();
+  })().catch(error => {
+    state.started = false;
+    console.error('TavernAssetClassifier: initialization failed', error, host.moduleErrors);
+    showStartupStatus(`加载失败：${error.message}`, true);
+  }).finally(() => { state.starting = null; });
+  return state.starting;
+}
+
+window.addEventListener('pagehide', event => {
+  if (event.persisted) return;
+  clearInterval(state.featureMountTimer);
+  clearTimeout(state.characterBindingTimer);
+  clearTimeout(state.characterBindingRenderTimer);
+  stopThemeBackgroundSync();
+  state.observer?.disconnect();
+  state.themePickerCleanup?.();
+  for (const { source, type, handler } of state.boundEvents) source.removeListener?.(type, handler);
+  state.boundEvents = [];
+}, { once: true });
+
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => void start(), { once: true });
+else void start();
