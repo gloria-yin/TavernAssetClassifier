@@ -356,6 +356,43 @@ try {
   assert.deepEqual(await evaluate('__fixture.errors'), []);
   console.log('PASS desktop: fresh install, labels/filter, chat/text presets, user, complete worldbooks, transfer, auto-apply/retry, character-switch guard, UI save, import/rename, panel remount');
 
+  await navigate('preset-dialogs');
+  await ready();
+  await waitFor('__tac.state.lastAppliedCharacterBindingKey==="0:alpha.png"');
+  await evaluate(`__fixture.orders[0]=[{identifier:'extra',enabled:true},{identifier:'main',enabled:false}];window.__expectedPreset=__tac.capturePresetBinding('Dialog snapshot');document.querySelector('#tac-character-binding-body .tac-binding-module:nth-child(2) .tac-binding-save').click();`);
+  await waitFor('!!document.querySelector("#tac-binding-modal input")');
+  await evaluate(`__tac.applyPresetBinding({presetName:'Preset Two',promptOrder:[{identifier:'main',enabled:true}]})`);
+  await evaluate('document.querySelector("#tac-binding-modal input").value="Dialog snapshot";document.querySelector("#tac-binding-modal [data-action=confirm]").click()');
+  await waitFor('__fixture.diskCharacters["alpha.png"].data.extensions.tavernAssetClassifier?.presets.items.length===1');
+  const dialogSaved = await evaluate('__fixture.diskCharacters["alpha.png"].data.extensions.tavernAssetClassifier.presets.items[0]');
+  assert.equal(dialogSaved.presetName, 'Preset One', 'save must use the preset selected before the naming dialog');
+  assert.deepEqual(dialogSaved.promptOrder, await evaluate('__expectedPreset.promptOrder'));
+  await evaluate(`__tac.applyPresetBinding(${JSON.stringify(dialogSaved)})`);
+  assert.equal(await evaluate('__fixture.presetName'), 'Preset One');
+  assert.deepEqual(await evaluate('__fixture.orders[0]'), dialogSaved.promptOrder);
+
+  await waitFor('!!document.querySelector(".tac-binding-update")');
+  await evaluate(`__fixture.orders[0][0].enabled=false;window.__expectedPreset=__tac.capturePresetBinding('Dialog snapshot');document.querySelector('.tac-binding-update').click();`);
+  await waitFor('!!document.querySelector("#tac-binding-modal .tac-confirm-body")');
+  await evaluate(`__tac.applyPresetBinding({presetName:'Preset Two',promptOrder:[{identifier:'main',enabled:true}]})`);
+  await evaluate('document.querySelector("#tac-binding-modal [data-action=confirm]").click()');
+  await waitFor('!!__fixture.diskCharacters["alpha.png"].data.extensions.tavernAssetClassifier.presets.items[0].updatedAt');
+  const dialogUpdated = await evaluate('__fixture.diskCharacters["alpha.png"].data.extensions.tavernAssetClassifier.presets.items[0]');
+  assert.equal(dialogUpdated.presetName, 'Preset One', 'update must use the preset named in the confirmation');
+  assert.deepEqual(dialogUpdated.promptOrder, await evaluate('__expectedPreset.promptOrder'));
+  assert.equal(dialogUpdated.id, dialogSaved.id);
+  await evaluate(`__tac.applyPresetBinding(${JSON.stringify(dialogUpdated)})`);
+  assert.deepEqual(await evaluate('__fixture.orders[0]'), dialogUpdated.promptOrder);
+
+  await evaluate('document.querySelector(".tac-binding-update").click()');
+  await waitFor('!!document.querySelector("#tac-binding-modal .tac-confirm-body")');
+  await evaluate('__fixture.characterId=1;__fixture.manager.activeCharacter={id:1};document.querySelector("#tac-binding-modal [data-action=confirm]").click()');
+  await waitFor('__fixture.messages.some(item=>item.type==="error" && item.message.includes("角色已切换"))');
+  assert.equal(await evaluate('__fixture.diskCharacters["beta.png"].data.extensions.tavernAssetClassifier'), undefined);
+  assert.deepEqual(await evaluate('__fixture.diskCharacters["alpha.png"].data.extensions.tavernAssetClassifier.presets.items[0]'), dialogUpdated);
+  assert.deepEqual(await evaluate('__fixture.errors'), []);
+  console.log('PASS preset dialogs: save/update snapshots survive preset changes, reload restores the captured order, character switches stop updates');
+
   await navigate('existing', 390);
   await ready();
   assert.equal(await evaluate('__tac.getSettings().futureField'), 'keep');

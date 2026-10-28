@@ -559,8 +559,11 @@ function getCurrentPromptPresetSelect() {
     textgenerationwebui: '#settings_preset_textgenerationwebui',
     novel: '#settings_preset_novel',
   }[host.main_api];
+  if (activeSelector) {
+    const select = document.querySelector(activeSelector);
+    return normalizeTag(select?.value) ? select : null;
+  }
   const preferredSelectors = [
-    ...(activeSelector ? [activeSelector] : []),
     '#settings_preset_openai',
     '#settings_preset_textgenerationwebui',
     '#settings_preset_novel',
@@ -2113,12 +2116,14 @@ function getCurrentPromptOrderSnapshot() {
 }
 
 function capturePresetBinding(name) {
+  const select = getCurrentPromptPresetSelect();
+  const selected = select?.selectedOptions?.[0];
   return {
     id: makeBindingId(),
     name,
     createdAt: new Date().toISOString(),
-    presetName: getCurrentPromptPresetName(),
-    presetValue: getCurrentPromptPresetValue(),
+    presetName: normalizeTag(selected?.textContent || select?.value),
+    presetValue: normalizeTag(select?.value),
     promptOrder: getCurrentPromptOrderSnapshot(),
   };
 }
@@ -2246,11 +2251,13 @@ async function savePresetBinding() {
     notify('info', '当前没有可保存的预设。');
     return;
   }
-  const name = await requestBindingName('预设绑定名称', presetName);
+  // Freeze the selection and order before automatic bindings can change them during the dialog.
+  const snapshot = capturePresetBinding(presetName);
+  const name = await requestBindingName('预设绑定名称', snapshot.presetName);
   if (!name) return;
   assertCharacterContext(characterKey);
   const bindings = getCurrentCharacterBindings();
-  bindings.presets.items.unshift(capturePresetBinding(name));
+  bindings.presets.items.unshift({ ...snapshot, name });
   if (await saveCurrentCharacterBindings(bindings)) notify('success', '预设绑定已保存到当前角色卡。');
 }
 
@@ -2551,7 +2558,7 @@ async function applyPresetBinding(binding, { automatic = false } = {}) {
   const presetName = normalizeTag(binding.presetName);
   // Numeric option values can change when the host rebuilds its preset list.
   const matchedOption = presetName
-    ? options.find(option => normalizeTag(option.textContent) === presetName || option.value === presetName)
+    ? options.find(option => normalizeTag(option.textContent) === presetName)
     : options.find(option => binding.presetValue && option.value === binding.presetValue);
   if (!matchedOption && (binding.presetName || binding.presetValue)) throw new Error(`找不到预设：${getPresetBindingDisplayName(binding)}`);
   const hasPromptOrder = Array.isArray(binding.promptOrder) && binding.promptOrder.length > 0;
@@ -2790,17 +2797,21 @@ function requestUpdateBindingConfirmation(title, message) {
 }
 
 async function updatePresetBinding(id) {
+  const characterKey = getCurrentCharacterKey();
   const presetName = getCurrentPromptPresetName();
   if (!presetName) {
     notify('info', '当前没有可用于更新的预设。');
     return;
   }
+  const original = getCurrentCharacterBindings().presets.items.find(binding => binding.id === id);
+  if (!original) return;
+  const snapshot = capturePresetBinding(original.name);
+  if (!await requestUpdateBindingConfirmation('更新预设绑定', `将“${original.name}”更新为当前预设“${snapshot.presetName}”，是否继续？`)) return;
+  assertCharacterContext(characterKey);
+
   const bindings = getCurrentCharacterBindings();
   const item = bindings.presets.items.find(binding => binding.id === id);
   if (!item) return;
-  if (!await requestUpdateBindingConfirmation('更新预设绑定', `将“${item.name}”更新为当前预设“${presetName}”，是否继续？`)) return;
-
-  const snapshot = capturePresetBinding(item.name);
   Object.assign(item, snapshot, {
     id: item.id,
     name: item.name,

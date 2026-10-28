@@ -134,6 +134,29 @@ try {
   await evaluate('__tacNative.applyUserBinding(__tacNative.captureUserBinding("Native user"))');
   console.log('PASS native preset/user: real preset completion events, prompt order save and user interfaces');
 
+  await waitFor('!!document.querySelector("#tac-character-binding-body .tac-binding-module:nth-child(2) .tac-binding-save")');
+  await evaluate(`document.querySelector('#tac-character-binding-body .tac-binding-module:nth-child(2) .tac-binding-save').click()`);
+  await waitFor('!!document.querySelector("#tac-binding-modal input")');
+  await evaluate(`(async()=>{const select=document.querySelector('#settings_preset_openai');const option=[...select.options].find(o=>o.value!==select.value);await __tacNative.applyPresetBinding({presetName:option.textContent,promptOrder:[]});document.querySelector('#tac-binding-modal input').value='Native dialog snapshot';document.querySelector('#tac-binding-modal [data-action=confirm]').click();})()`);
+  const readNativeBindings = `(async()=>{const r=await fetch('/api/characters/get',{method:'POST',headers:__tacNative.host.getRequestHeaders(),body:JSON.stringify({avatar_url:${JSON.stringify(avatar)}})});return (await r.json()).data.extensions.tavernAssetClassifier;})()`;
+  await waitFor(`(async()=>{const b=await ${readNativeBindings};return b?.presets.items.some(item=>item.name==='Native dialog snapshot');})()`);
+  const nativeDialogSaved = (await evaluate(readNativeBindings)).presets.items.find(item => item.name === 'Native dialog snapshot');
+  assert.equal(nativeDialogSaved.presetName, await evaluate('__nativePreset.presetName'));
+  assert.deepEqual(nativeDialogSaved.promptOrder, desiredNativeOrder);
+  await evaluate(`__tacNative.applyPresetBinding(${JSON.stringify(nativeDialogSaved)})`);
+  await waitFor('!!document.querySelector(".tac-binding-update")');
+  await evaluate(`document.querySelector('.tac-binding-update').click()`);
+  await waitFor('!!document.querySelector("#tac-binding-modal .tac-confirm-body")');
+  await evaluate(`(async()=>{const select=document.querySelector('#settings_preset_openai');const option=[...select.options].find(o=>o.value!==select.value);await __tacNative.applyPresetBinding({presetName:option.textContent,promptOrder:[]});document.querySelector('#tac-binding-modal [data-action=confirm]').click();})()`);
+  await waitFor(`(async()=>{const b=await ${readNativeBindings};return !!b.presets.items.find(item=>item.id===${JSON.stringify(nativeDialogSaved.id)}).updatedAt;})()`);
+  const nativeDialogUpdated = (await evaluate(readNativeBindings)).presets.items.find(item => item.id === nativeDialogSaved.id);
+  assert.equal(nativeDialogUpdated.presetName, nativeDialogSaved.presetName);
+  assert.deepEqual(nativeDialogUpdated.promptOrder, desiredNativeOrder);
+  await evaluate(`__tacNative.applyPresetBinding(${JSON.stringify(nativeDialogUpdated)})`);
+  assert.equal(await evaluate('document.querySelector("#settings_preset_openai").selectedOptions[0].textContent.trim()'), nativeDialogSaved.presetName);
+  assert.ok(JSON.parse(await readFile(join(userRoot, 'settings.json'), 'utf8')).oai_settings.prompt_order.some(item => JSON.stringify(item.order) === JSON.stringify(desiredNativeOrder)));
+  console.log('PASS native preset dialogs: save and update retain the original preset/order through a switch, verified from disk and reapplied');
+
   const book = { entries: { 0: { uid: 0, content: 'Native world entry', key: ['native'], disable: false } }, metadata: { preserved: true } };
   await evaluate(`(async()=>{await __tacNative.host.saveWorldInfo('TAC native smoke',${JSON.stringify(book)},true);__tacNative.host.updateWorldInfoSettings(structuredClone(__tacNative.host.getWorldInfoSettings()),['TAC native smoke']);await __tacNative.host.updateWorldInfoList();window.__nativeWorld=await __tacNative.captureWorldBookBinding('Native world');await __tacNative.host.saveWorldInfo('TAC native smoke',{entries:{}},true);await __tacNative.applyWorldBookBinding(__nativeWorld,{automatic:true});})()`);
   assert.deepEqual(await evaluate('__tacNative.readSavedWorldBook("TAC native smoke")'), book);
