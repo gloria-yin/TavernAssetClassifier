@@ -1151,7 +1151,12 @@ body.tac-modal-open {
 
 #tac-tag-modal,
 #tac-rename-modal,
-#tac-binding-modal {
+#tac-binding-modal,
+#tac-music-add-modal,
+#tac-music-url-modal,
+#tac-music-track-modal,
+#tac-music-playlist-modal,
+#tac-music-track-playlist-modal {
   position: fixed;
   inset: 0;
   z-index: 10050;
@@ -1165,7 +1170,12 @@ body.tac-modal-open {
 
 html > #tac-tag-modal,
 html > #tac-rename-modal,
-html > #tac-binding-modal {
+html > #tac-binding-modal,
+html > #tac-music-add-modal,
+html > #tac-music-url-modal,
+html > #tac-music-track-modal,
+html > #tac-music-playlist-modal,
+html > #tac-music-track-playlist-modal {
   position: fixed !important;
   inset: 0 !important;
   width: 100vw !important;
@@ -1517,7 +1527,12 @@ html > #tac-binding-modal {
 
   #tac-tag-modal,
   #tac-rename-modal,
-  #tac-binding-modal {
+  #tac-binding-modal,
+  #tac-music-add-modal,
+  #tac-music-url-modal,
+  #tac-music-track-modal,
+  #tac-music-playlist-modal,
+  #tac-music-track-playlist-modal {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1537,7 +1552,12 @@ html > #tac-binding-modal {
   }
 
   #tac-rename-modal .tac-modal-card,
-  #tac-binding-modal .tac-modal-card {
+  #tac-binding-modal .tac-modal-card,
+  #tac-music-add-modal .tac-modal-card,
+  #tac-music-url-modal .tac-modal-card,
+  #tac-music-track-modal .tac-modal-card,
+  #tac-music-playlist-modal .tac-modal-card,
+  #tac-music-track-playlist-modal .tac-modal-card {
     height: auto;
     width: min(420px, calc(100vw - 24px));
     max-height: calc(100dvh - 24px);
@@ -1546,6 +1566,16 @@ html > #tac-binding-modal {
   }
 
   #tac-binding-modal.tac-binding-form-modal {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #tac-music-add-modal.tac-binding-form-modal,
+  #tac-music-url-modal.tac-binding-form-modal,
+  #tac-music-track-modal.tac-binding-form-modal,
+  #tac-music-playlist-modal.tac-binding-form-modal,
+  #tac-music-track-playlist-modal.tac-binding-form-modal {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1671,5 +1701,631 @@ html > #tac-binding-modal {
 
   .tac-modal-actions .menu_button {
     flex: 1 1 0;
+  }
+}
+
+/* 角色专属音乐播放器 */
+.tac-music-module {
+  gap: 8px;
+}
+
+.tac-music-module > .tac-binding-module-head {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+}
+
+.tac-music-module-actions,
+.tac-music-controls,
+.tac-music-floating-actions,
+.tac-music-playlist-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tac-music-module-actions {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  justify-content: flex-end;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.tac-music-add-button {
+  display: inline-flex !important;
+  flex: 0 0 auto;
+  flex-direction: row !important;
+  align-items: center;
+  writing-mode: horizontal-tb !important;
+  min-width: max-content;
+  min-height: 30px;
+  padding-inline: 8px;
+  white-space: nowrap !important;
+}
+
+.tac-music-player-card {
+  display: grid;
+  gap: 7px;
+  padding: 4px 0 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.tac-music-current-track {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.tac-music-progress-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.tac-music-progress {
+  width: 100%;
+  accent-color: #38bdf8;
+}
+
+.tac-music-time {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 60%, transparent);
+  font-size: .78em;
+  white-space: nowrap;
+}
+
+.tac-music-controls {
+  justify-content: flex-start;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.tac-music-controls .menu_button {
+  flex: 0 0 auto;
+  min-width: 34px;
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.tac-music-controls .tac-music-play-toggle {
+  width: 42px;
+  min-width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: color-mix(in srgb, #38bdf8 70%, var(--SmartThemeBlurTintColor, #222));
+  color: #06111a;
+}
+
+.tac-music-controls .tac-music-mode {
+  gap: 5px;
+  width: 34px;
+  min-width: 34px;
+  padding-inline: 0;
+}
+
+.tac-music-track-list,
+.tac-music-search-results,
+.tac-music-playlist-list {
+  display: grid;
+  gap: 5px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.tac-music-track-row,
+.tac-music-search-result,
+.tac-music-playlist-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 12%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 4%, transparent);
+}
+
+.tac-music-track-row.is-current {
+  border-color: color-mix(in srgb, #38bdf8 75%, transparent);
+  background: color-mix(in srgb, #38bdf8 14%, transparent);
+}
+
+.tac-music-track-main {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tac-music-track-title,
+.tac-music-track-artist,
+.tac-music-search-result b,
+.tac-music-search-result small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tac-music-track-artist,
+.tac-music-search-result small {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 56%, transparent);
+  font-size: .8em;
+}
+
+.tac-music-track-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 3px;
+}
+
+.tac-music-track-actions .tac-binding-icon {
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+}
+
+.tac-music-add-card,
+.tac-music-playlist-card,
+.tac-music-url-card {
+  width: min(620px, calc(100vw - 24px));
+}
+
+/* Music dialogs keep their body content away from the card edge. The header
+   and footer already have their own padding, while these rows are direct
+   children of the modal card. */
+.tac-music-add-card > .tac-music-add-tabs {
+  margin: 12px 12px 10px;
+}
+
+.tac-music-add-card > .tac-music-add-pane {
+  margin: 0 12px 14px;
+}
+
+.tac-music-playlist-card > .tac-music-playlist-toolbar {
+  margin: 12px 12px 10px;
+  gap: 8px;
+}
+
+.tac-music-playlist-card > .tac-music-playlist-list {
+  margin: 0 12px 12px;
+}
+
+.tac-music-playlist-toolbar {
+  flex-direction: column;
+  align-items: stretch;
+  flex-wrap: nowrap;
+}
+
+.tac-music-playlist-toolbar .menu_button {
+  width: 100%;
+}
+
+.tac-music-form-card > .tac-music-form-fields {
+  padding: 12px;
+}
+
+.tac-music-add-tabs {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 6px;
+  margin-bottom: 9px;
+}
+
+.tac-music-add-tabs .menu_button {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 36px;
+  white-space: nowrap;
+  writing-mode: horizontal-tb !important;
+}
+
+.tac-music-add-tabs .menu_button.is-active {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+
+.tac-music-help {
+  margin: 0 0 8px;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 62%, transparent);
+  font-size: .86em;
+}
+
+.tac-music-file-button {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  white-space: nowrap !important;
+  writing-mode: horizontal-tb !important;
+  margin-top: 2px;
+}
+
+.tac-music-file-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.tac-music-file-actions .tac-music-file-button {
+  flex: 0 0 auto;
+}
+
+.tac-music-file-input {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-height: 34px;
+  margin-bottom: 7px;
+  font-size: .84em;
+}
+
+.tac-music-file-name {
+  margin-top: 7px;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 56%, transparent);
+  font-size: .82em;
+}
+
+.tac-music-url-fields {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.tac-music-url-fields label {
+  display: grid;
+  gap: 5px;
+  font-size: .86em;
+}
+
+.tac-music-url-fields small,
+.tac-music-url-status {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 62%, transparent);
+  font-size: .8em;
+  line-height: 1.4;
+}
+
+.tac-music-url-status {
+  min-height: 1.2em;
+  color: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 78%, var(--SmartThemeBodyColor, #eee));
+}
+
+.tac-music-search-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.tac-music-add-pane,
+.tac-music-search-row {
+  min-width: 0;
+}
+
+.tac-music-search-row > input {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.tac-music-add-card .menu_button,
+.tac-music-search-row > button {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  flex-direction: row !important;
+  writing-mode: horizontal-tb !important;
+  white-space: nowrap !important;
+}
+
+.tac-music-add-card .tac-icon-button {
+  min-height: 32px;
+  padding: 0;
+}
+
+.tac-music-add-card .menu_button:not(.tac-icon-button),
+.tac-music-playlist-card .tac-music-playlist-toolbar .menu_button,
+.tac-music-playlist-card .tac-modal-actions .menu_button,
+.tac-music-form-card .tac-modal-actions .menu_button {
+  padding: 7px 12px;
+}
+
+.tac-music-add-card input.text_pole,
+.tac-music-form-card input.text_pole {
+  padding-inline: 10px;
+}
+
+.tac-music-search-row > button {
+  flex: 0 0 auto;
+  min-width: max-content;
+}
+
+.tac-music-search-result > div {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 2px;
+}
+
+.tac-music-search-result-actions {
+  display: inline-flex !important;
+  flex: 0 0 auto !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 4px;
+}
+
+.tac-music-search-result-actions .tac-icon-button {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+}
+
+.tac-music-playlist-row {
+  display: grid;
+  gap: 7px;
+  cursor: pointer;
+}
+
+.tac-music-playlist-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tac-music-playlist-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tac-music-playlist-tracks {
+  display: grid;
+  gap: 4px;
+  margin-left: 24px;
+  padding: 6px 8px;
+  border-left: 2px solid color-mix(in srgb, #38bdf8 30%, transparent);
+  background: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 3%, transparent);
+}
+
+.tac-music-playlist-track-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: .82em;
+}
+
+.tac-music-playlist-track-check span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tac-music-no-tracks {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 55%, transparent);
+}
+
+.tac-music-playlist-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tac-music-playlist-options {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 70%, transparent);
+  font-size: .8em;
+}
+
+.tac-music-form-fields {
+  display: grid;
+  gap: 9px;
+  padding: 4px 0;
+}
+
+.tac-music-form-fields label {
+  display: grid;
+  gap: 5px;
+  font-size: .84em;
+}
+
+.tac-music-lyrics-file-status {
+  min-height: 1.2em;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 55%, transparent);
+  font-size: .8em;
+}
+
+.tac-music-track-details {
+  min-width: 0;
+  margin-top: 4px;
+}
+
+.tac-music-track-details > summary {
+  padding: 7px 2px;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 72%, transparent);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tac-music-track-details[open] > summary {
+  margin-bottom: 5px;
+  color: color-mix(in srgb, #38bdf8 72%, var(--SmartThemeBodyColor, #eee));
+}
+
+.tac-music-floating {
+  position: fixed !important;
+  z-index: 2147483000;
+  display: flex !important;
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  isolation: isolate;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(18px, env(safe-area-inset-bottom));
+  align-items: center;
+  box-sizing: border-box;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  flex: 0 0 44px;
+  overflow: visible;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  touch-action: none;
+  user-select: none;
+}
+
+.tac-music-floating.is-expanded {
+  width: min(320px, calc(100vw - 24px));
+  min-width: min(320px, calc(100vw - 24px));
+  max-width: min(320px, calc(100vw - 24px));
+  flex-basis: min(320px, calc(100vw - 24px));
+  height: auto;
+  min-height: 52px;
+  max-height: min(70dvh, 520px);
+  padding: 4px;
+  border: 1px solid color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 35%, transparent);
+  background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #202326) 72%, transparent);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .26);
+  border-radius: 14px;
+}
+
+.tac-music-floating-toggle {
+  flex: 0 0 38px;
+  width: 38px;
+  height: 38px;
+  border: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 78%, transparent);
+  color: var(--SmartThemeBodyColor, #fff);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 35%, transparent);
+  cursor: pointer;
+}
+
+.tac-music-floating.is-playing .tac-music-floating-toggle {
+  animation: tac-music-floating-spin 2.8s linear infinite;
+}
+
+@keyframes tac-music-floating-spin {
+  to { transform: rotate(360deg); }
+}
+
+.tac-music-floating-content {
+  display: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 4px 0 7px;
+}
+
+.tac-music-floating.is-expanded .tac-music-floating-content {
+  display: grid;
+  gap: 5px;
+}
+
+.tac-music-floating-actions {
+  justify-content: flex-start;
+}
+
+.tac-music-floating-actions .menu_button {
+  width: 29px;
+  min-width: 29px;
+  height: 29px;
+  min-height: 29px;
+  padding: 0;
+  border-color: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 38%, transparent);
+  background: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 16%, transparent);
+  color: var(--SmartThemeBodyColor, #fff);
+}
+
+.tac-music-floating-lyrics {
+  position: absolute;
+  z-index: 2;
+  left: auto;
+  right: calc(100% + 7px);
+  top: 50%;
+  width: min(220px, 52vw);
+  transform: translateY(-50%);
+  max-height: 130px;
+  overflow: auto;
+  min-height: 22px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, #000 18%, transparent);
+  color: color-mix(in srgb, #fff 92%, #38bdf8);
+  white-space: pre-wrap;
+  font-size: .78em;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.tac-music-floating.is-expanded .tac-music-floating-lyrics {
+  left: 4px;
+  right: auto;
+  top: calc(100% + 5px);
+  width: calc(100% - 8px);
+  transform: none;
+}
+
+@media (max-width: 560px) {
+  .tac-music-add-tabs .menu_button {
+    padding-inline: 5px;
+    font-size: .88em;
+  }
+
+  .tac-music-search-row {
+    display: flex;
+    flex-wrap: nowrap;
+  }
+
+}
+
+@media (max-width: 700px) {
+  .tac-music-floating {
+    z-index: 2147483000;
+    right: max(10px, env(safe-area-inset-right, 0px));
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   }
 }

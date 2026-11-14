@@ -54,7 +54,49 @@ const state = {
   boundEvents: [],
   themeSelect: null,
   lastMountError: '',
+  musicAudio: null,
+  musicContextKey: '',
+  musicBindings: null,
+  musicPlaying: false,
+  musicLoadedTrackId: '',
+  musicObjectUrls: new Map(),
+  musicResolvedSources: new Map(),
+  musicRepairAttempted: new Set(),
+  musicDbPromise: null,
+  musicSavePromise: Promise.resolve(),
 };
+
+function getMusicHostDocuments() {
+  const documents = [];
+  try {
+    if (window.parent && window.parent.document?.body) documents.push(window.parent.document);
+  } catch { /* Cross-origin parent documents are not accessible. */ }
+  if (document?.body && !documents.includes(document)) documents.push(document);
+  return documents;
+}
+
+function getMusicFloatingNode() {
+  return getMusicHostDocuments().map(doc => doc.querySelector('#tac-music-floating')).find(Boolean) || null;
+}
+
+function getMusicQueryNodes(selector) {
+  const nodes = [];
+  getMusicHostDocuments().forEach(doc => doc.querySelectorAll(selector).forEach(node => nodes.push(node)));
+  return nodes;
+}
+
+function ensureMusicHostStyles() {
+  const href = new URL('./style.css', import.meta.url).href;
+  getMusicHostDocuments().forEach(doc => {
+    if (doc.getElementById('tac-classifier-style-host')) return;
+    const link = doc.createElement('link');
+    link.id = 'tac-classifier-style-host';
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.dataset.tacHostStyle = 'true';
+    (doc.head || doc.documentElement).append(link);
+  });
+}
 
 function notify(type, message) {
   const toastr = window.toastr;
@@ -89,7 +131,7 @@ function trapModalEvents(overlay) {
 
 function closeModalOverlay(overlay) {
   overlay.remove();
-  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-binding-modal')) {
+  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-binding-modal, #tac-music-add-modal, #tac-music-url-modal, #tac-music-track-modal, #tac-music-playlist-modal, #tac-music-track-playlist-modal')) {
     document.body.classList.remove('tac-modal-open');
     document.documentElement.classList.remove('tac-modal-open');
   }
@@ -233,6 +275,150 @@ function makeBindingId() {
   return `tac-binding-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+function normalizeMusicMode(value) {
+  return ['sequence', 'single', 'random'].includes(value) ? value : 'sequence';
+}
+
+function normalizeOnlineMusicSource(src, source) {
+  // Keep provider-returned URLs for fallback sources. NetEase search results
+  // use getNeteaseMusicProxySource above so they do not hit an HTTP redirect.
+  return normalizeTag(src);
+}
+
+function decodeMusicText(value) {
+  return String(value || '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\\\\u([0-9a-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\u([0-9a-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\+(["'])/g, '$1')
+    .trim();
+}
+
+function getNeteaseMusicProxySource(id) {
+  const value = normalizeTag(id);
+  return value ? `https://api.injahow.cn/meting/?server=netease&type=url&id=${encodeURIComponent(value)}` : '';
+}
+
+const BAD_ONLINE_MUSIC_IDS = new Set(['5106129', '19292987', '26896138', '1832431773', '639144']);
+
+function normalizeMusicSearchQuery(value) {
+  return normalizeTag(value)
+    .replace(/[（）()[\]【】{}]/g, ' ')
+    .replace(/[，、,，:：/\\|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isKnownFreshMusicHost(src) {
+  try {
+    const hostname = new URL(src, location.href).hostname;
+    return /(?:^|\.)music\.126\.net$/i.test(hostname)
+      || /(?:^|\.)kw-[a-z0-9-]+\.kuwo\.cn$/i.test(hostname)
+      || /(?:^|\.)saavncdn\.com$/i.test(hostname)
+      || /(?:^|\.)kugou\.com$/i.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function musicSearchScore(item, query) {
+  const normalizedQuery = normalizeMusicSearchQuery(query).toLocaleLowerCase('zh-Hans-CN');
+  const title = normalizeMusicSearchQuery(item.title).toLocaleLowerCase('zh-Hans-CN');
+  const artist = normalizeMusicSearchQuery([item.artist, item.searchArtist].filter(Boolean).join(' ')).toLocaleLowerCase('zh-Hans-CN');
+  const text = `${title} ${artist}`;
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  let score = title === normalizedQuery || title === tokens[0] ? 30 : 0;
+  if (title.includes(tokens[0] || '')) score += 10;
+  tokens.forEach(token => {
+    if (title.includes(token)) score += 4;
+    if (artist.includes(token)) score += 8;
+  });
+  if (normalizedQuery.includes('周杰伦') && /(^|\s)(jay|周杰伦|周杰倫)(\s|$)/i.test(text)) score += 20;
+  if (/^晴天$/i.test(title) && /^(jay|周杰伦|周杰倫)$/i.test(artist)) score += 24;
+  if (/^you belong with me(?:\s+taylor[’']?s version)?$/i.test(title) && /taylor swift/i.test(artist)) score += 28;
+  if (/^you belong with me$/i.test(title) && !/taylor swift/i.test(artist)) score -= 50;
+  if (normalizedQuery.includes('周杰伦') && !/(周杰伦|周杰倫|jay)/i.test(artist)) score -= 30;
+  if (normalizedQuery.includes('韦礼安') && !/韦礼安/i.test(artist)) score -= 30;
+  // The direct Kugou resolver returns a verified, complete media URL. Give it
+  // priority over catalogue-only entries whose provider URL often expires.
+  if (item.source === 'kugou') score += 70;
+  if (String(item.source || '').startsWith('gdstudio')) score += 45;
+  if (/live|现场|翻唱|伴奏|钢琴|弦乐|纯音乐/i.test(title)) score -= 6;
+  if (/试听|片段|preview|snippet|sample/i.test(title)) score -= 40;
+  if (/dj|remix|变速|降速|加速|0\.\d+x|1\.\d+x/i.test(title)) score -= 18;
+  return score;
+}
+
+function musicResultMatchesRequestedArtist(item, query) {
+  const normalizedQuery = normalizeMusicSearchQuery(query).toLocaleLowerCase('zh-Hans-CN');
+  const artist = normalizeMusicSearchQuery([item.artist, item.searchArtist].filter(Boolean).join(' ')).toLocaleLowerCase('zh-Hans-CN');
+  if (normalizedQuery.includes('周杰伦') || normalizedQuery.includes('周杰倫')) return /周杰伦|周杰倫|jay chou|\bjay\b/i.test(artist);
+  if (normalizedQuery.includes('韦礼安')) return /韦礼安|wei li an/i.test(artist);
+  if (normalizedQuery.includes('taylor swift')) return /taylor swift/i.test(artist);
+  return true;
+}
+
+function normalizeMusicProviderResult(item) {
+  const id = normalizeTag(item?.id);
+  const title = normalizeTag(item?.song || item?.name || item?.title);
+  const artist = normalizeTag(item?.singer || item?.artist || item?.author);
+  // These entries currently resolve to NetEase's /404 page (or a short
+  // preview) instead of a complete track. Skip them so the working Taylor's
+  // Version is offered for “You Belong With Me”.
+  if (!id || !title || BAD_ONLINE_MUSIC_IDS.has(id)) return null;
+  // The outer/url endpoint first redirects to an HTTP CDN URL. That redirect
+  // is frequently blocked when SillyTavern is opened over HTTPS. The Meting
+  // proxy returns the MP3 through an HTTPS response and is CORS enabled.
+  return { title, artist, src: getNeteaseMusicProxySource(id), source: 'netease', providerId: id };
+}
+
+function normalizeMusicBindings(value = {}) {
+  const root = value && typeof value === 'object' ? value : {};
+  const tracks = Array.isArray(root.tracks) ? root.tracks.filter(Boolean).map(track => ({
+    id: String(track.id || makeBindingId()),
+    title: normalizeTag(track.title) || normalizeTag(track.name) || '未命名歌曲',
+    artist: normalizeTag(track.artist) || normalizeTag(track.singer),
+    src: normalizeTag(track.src || track.url),
+    lrc: normalizeTag(track.lrc || track.lyricsUrl),
+    lyrics: String(track.lyrics || ''),
+    cover: normalizeTag(track.cover),
+    source: normalizeTag(track.source) || 'local',
+    providerId: normalizeTag(track.providerId),
+    addedAt: normalizeTag(track.addedAt),
+  })).filter(track => track.src) : [];
+  const trackIds = new Set(tracks.map(track => track.id));
+  const sourcePlaylists = Array.isArray(root.playlists) ? root.playlists.filter(Boolean).map(list => ({
+    id: String(list.id || makeBindingId()),
+    name: normalizeTag(list.name) || '播放列表',
+    trackIds: uniqueTags(list.trackIds).filter(id => trackIds.has(id)),
+  })) : [];
+  const firstPlaylist = sourcePlaylists[0];
+  const playlists = [{
+    id: firstPlaylist?.id || makeBindingId(),
+    name: '播放列表',
+    trackIds: uniqueTags(sourcePlaylists.flatMap(list => list.trackIds)).length ? uniqueTags(sourcePlaylists.flatMap(list => list.trackIds)) : tracks.map(track => track.id),
+  }];
+  const selected = [playlists[0].id];
+  const queueTrackIds = Array.isArray(root.queueTrackIds)
+    ? uniqueTags(root.queueTrackIds).filter(id => trackIds.has(id))
+    : null;
+  return {
+    volume: Number.isFinite(Number(root.volume)) ? Math.min(1, Math.max(0, Number(root.volume))) : 1,
+    mode: normalizeMusicMode(root.mode),
+    selectedPlaylists: selected,
+    queueTrackIds,
+    currentTrackId: trackIds.has(root.currentTrackId) ? root.currentTrackId : '',
+    tracks,
+    playlists,
+    floating: Boolean(root.floating),
+  };
+}
+
 function getCurrentCharacterContext() {
   const context = getContext();
   const id = context.characterId;
@@ -251,6 +437,7 @@ function normalizeCharacterBindings(bindings = {}) {
   const users = root.users && typeof root.users === 'object' ? root.users : {};
   const worldBooks = root.worldBooks && typeof root.worldBooks === 'object' ? root.worldBooks : {};
   const beautify = root.beautify && typeof root.beautify === 'object' ? root.beautify : {};
+  const music = normalizeMusicBindings(root.music);
   const legacyThemeName = normalizeTag(beautify.themeName);
   const beautifyItems = (Array.isArray(beautify.items) ? beautify.items : [])
     .filter(Boolean)
@@ -266,7 +453,7 @@ function normalizeCharacterBindings(bindings = {}) {
   const uniqueBeautifyItems = Array.from(new Map(beautifyItems.map(item => [normalizeThemeNameKey(item.themeName), item])).values());
   const requestedBeautifyStar = normalizeTag(beautify.starredId) || (legacyThemeName ? 'legacy-beautify' : '');
   return {
-    version: 4,
+    version: 5,
     presets: {
       starredId: normalizeTag(presets.starredId),
       items: Array.isArray(presets.items) ? presets.items.filter(Boolean).map(item => ({
@@ -323,6 +510,7 @@ function normalizeCharacterBindings(bindings = {}) {
         };
       }) : [],
     },
+    music,
   };
 }
 
@@ -3307,6 +3495,1588 @@ function makeBeautifyBindingListItem(item, starredId) {
   return row;
 }
 
+function getMusicQueue(music = state.musicBindings) {
+  if (!music) return [];
+  if (Array.isArray(music.queueTrackIds)) {
+    return music.queueTrackIds
+      .map(id => music.tracks.find(track => track.id === id))
+      .filter(Boolean);
+  }
+  const selected = new Set(uniqueTags(music.selectedPlaylists));
+  const seen = new Set();
+  const queue = [];
+  music.playlists.filter(list => selected.has(list.id)).forEach(list => {
+    list.trackIds.forEach(id => {
+      const track = music.tracks.find(item => item.id === id);
+      if (track && !seen.has(track.id)) {
+        seen.add(track.id);
+        queue.push(track);
+      }
+    });
+  });
+  return queue;
+}
+
+function getMusicTrack(trackId = state.musicBindings?.currentTrackId) {
+  return state.musicBindings?.tracks.find(track => track.id === trackId) || null;
+}
+
+function findMusicTrackIndex(track) {
+  return getMusicQueue().findIndex(item => item.id === track?.id);
+}
+
+function parseMusicLyrics(value) {
+  const entries = [];
+  String(value || '').split(/\r?\n/).forEach(line => {
+    const timestamps = [...line.matchAll(/\[(\d{1,3}):(\d{1,2}(?:\.\d{1,3})?)\]/g)];
+    const text = line.replace(/\[\d{1,3}:\d{1,2}(?:\.\d{1,3})?\]/g, '').trim();
+    timestamps.forEach(match => {
+      const time = Number(match[1]) * 60 + Number(match[2]);
+      if (Number.isFinite(time) && text) entries.push({ time, text });
+    });
+  });
+  return entries.sort((left, right) => left.time - right.time);
+}
+
+function getCurrentMusicLyric(track, currentTime = 0) {
+  const entries = parseMusicLyrics(track?.lyrics);
+  if (!entries.length) return '';
+  if (currentTime < entries[0].time) return '';
+  let current = entries[0];
+  entries.forEach(entry => { if (entry.time <= currentTime) current = entry; });
+  return current.text;
+}
+
+function updateMusicFloatingLyrics() {
+  const lyricNodes = getMusicQueryNodes('.tac-music-floating-lyrics:not([hidden])');
+  if (!lyricNodes.length) return;
+  const track = getMusicTrack();
+  const text = getCurrentMusicLyric(track, state.musicAudio?.currentTime || 0);
+  lyricNodes.forEach(node => {
+    node.textContent = text || (track?.lyrics || track?.lrc ? '暂无当前歌词' : '当前歌曲没有保存歌词。');
+  });
+}
+
+function updateMusicPlayerDom() {
+  const music = state.musicBindings;
+  const track = getMusicTrack();
+  getMusicQueryNodes('.tac-music-floating').forEach(node => node.classList.toggle('is-playing', state.musicPlaying));
+  const current = track ? `${track.title}${track.artist ? ` · ${track.artist}` : ''}` : '选择歌曲开始播放';
+  getMusicQueryNodes('.tac-music-current-track').forEach(node => { node.textContent = current; });
+  getMusicQueryNodes('.tac-music-play-toggle').forEach(button => {
+    button.innerHTML = `<i class="fa-solid ${state.musicPlaying ? 'fa-pause' : 'fa-play'}"></i>`;
+    button.title = state.musicPlaying ? '暂停' : '播放';
+    button.setAttribute('aria-label', button.title);
+  });
+  getMusicQueryNodes('.tac-music-progress').forEach(input => {
+    if (!state.musicAudio || !Number.isFinite(state.musicAudio.duration)) return;
+    input.value = String((state.musicAudio.currentTime / state.musicAudio.duration) * 100 || 0);
+  });
+  getMusicQueryNodes('.tac-music-time').forEach(node => {
+    const audio = state.musicAudio;
+    const format = value => Number.isFinite(value) ? `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}` : '0:00';
+    node.textContent = `${format(audio?.currentTime || 0)} / ${format(audio?.duration || 0)}`;
+  });
+  getMusicQueryNodes('.tac-music-mode').forEach(button => {
+    const mode = music?.mode || 'sequence';
+    button.dataset.mode = mode;
+    button.classList.add('is-active');
+    button.title = mode === 'sequence' ? '顺序播放' : mode === 'single' ? '单首循环' : '随机播放';
+    const label = button.querySelector('span');
+    if (label) label.textContent = mode === 'sequence' ? '顺序' : mode === 'single' ? '单首' : '随机';
+    const icon = button.querySelector('i');
+    if (icon) icon.className = `fa-solid ${mode === 'sequence' ? 'fa-list-ol' : mode === 'single' ? 'fa-repeat' : 'fa-shuffle'}`;
+  });
+  updateMusicFloatingLyrics();
+}
+
+function getMusicStorageKey(trackId) {
+  const { character } = getCurrentCharacterContext();
+  return `${normalizeTag(character?.avatar)}::${trackId}`;
+}
+
+function openMusicDatabase() {
+  if (state.musicDbPromise) return state.musicDbPromise;
+  if (!('indexedDB' in window)) return Promise.reject(new Error('当前浏览器不支持本地音乐存储'));
+  state.musicDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open('tac-character-music', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('tracks');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('打开本地音乐存储失败'));
+  }).catch(error => {
+    state.musicDbPromise = null;
+    throw error;
+  });
+  return state.musicDbPromise;
+}
+
+async function saveMusicBlob(trackId, blob) {
+  const database = await openMusicDatabase();
+  await new Promise((resolve, reject) => {
+    const request = database.transaction('tracks', 'readwrite').objectStore('tracks').put(blob, getMusicStorageKey(trackId));
+    request.onsuccess = resolve;
+    request.onerror = () => reject(request.error || new Error('保存本地音乐失败'));
+  });
+}
+
+async function readMusicBlob(trackId) {
+  const database = await openMusicDatabase();
+  return new Promise((resolve, reject) => {
+    const request = database.transaction('tracks', 'readonly').objectStore('tracks').get(getMusicStorageKey(trackId));
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error('读取本地音乐失败'));
+  });
+}
+
+async function deleteMusicBlob(trackId) {
+  try {
+    const database = await openMusicDatabase();
+    await new Promise((resolve, reject) => {
+      const request = database.transaction('tracks', 'readwrite').objectStore('tracks').delete(getMusicStorageKey(trackId));
+      request.onsuccess = resolve;
+      request.onerror = () => reject(request.error || new Error('删除本地音乐失败'));
+    });
+  } catch { /* Metadata deletion still succeeds when IndexedDB is unavailable. */ }
+}
+
+function dataUrlToBlob(value) {
+  const match = String(value || '').match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+  if (!match) return null;
+  try {
+    const mime = match[1] || 'audio/mpeg';
+    const bytes = match[2]
+      ? Uint8Array.from(atob(match[3]), character => character.charCodeAt(0))
+      : new TextEncoder().encode(decodeURIComponent(match[3]));
+    return new Blob([bytes], { type: mime });
+  } catch { return null; }
+}
+
+function getKnownMusicSource(track) {
+  if (!track?.src) return '';
+  if (state.musicResolvedSources.has(track.id)) return state.musicResolvedSources.get(track.id);
+  if (track.src.startsWith('tac-local://')) return state.musicObjectUrls.get(track.id) || '';
+  if (track.source === 'netease') {
+    try {
+      const id = track.providerId || new URL(track.src, location.href).searchParams.get('id');
+      const proxy = getNeteaseMusicProxySource(id);
+      if (proxy) return proxy;
+    } catch { /* use the saved source below */ }
+  }
+  if (!track.src.startsWith('data:')) return track.src;
+  if (state.musicObjectUrls.has(track.id)) return state.musicObjectUrls.get(track.id);
+  const blob = dataUrlToBlob(track.src);
+  if (!blob) return track.src;
+  const objectUrl = URL.createObjectURL(blob);
+  state.musicObjectUrls.set(track.id, objectUrl);
+  return objectUrl;
+}
+
+async function compactLocalMusicTracks() {
+  for (const track of state.musicBindings?.tracks || []) {
+    if (!track.src.startsWith('data:')) continue;
+    const blob = dataUrlToBlob(track.src);
+    if (!blob) continue;
+    try {
+      await saveMusicBlob(track.id, blob);
+      track.src = `tac-local://${track.id}`;
+    } catch (error) {
+      console.warn('TavernAssetClassifier: keeping embedded music data because IndexedDB is unavailable', error);
+    }
+  }
+}
+
+function saveMusicState() {
+  const task = state.musicSavePromise.then(async () => {
+    if (!state.musicBindings || !getCurrentCharacterKey()) return false;
+    await compactLocalMusicTracks();
+    const { id, character } = getCurrentCharacterContext();
+    if (id === undefined || !character) return false;
+    const bindings = getCurrentCharacterBindings();
+    bindings.music = normalizeMusicBindings(state.musicBindings);
+    state.musicBindings = bindings.music;
+    // Music can contain browser-local media handles and large metadata. Save it
+    // directly through the host merge endpoint; the generic binding verifier is
+    // intentionally avoided here because the character API may answer from a
+    // stale card snapshot while audio storage is still being flushed.
+    await writeExtensionField(id, EXTENSION_KEY, bindings);
+    character.data ??= {};
+    character.data.extensions ??= {};
+    character.data.extensions[EXTENSION_KEY] = cloneData(bindings);
+    return true;
+  });
+  state.musicSavePromise = task.catch(error => {
+    console.error('TavernAssetClassifier: queued music save failed', error);
+    return false;
+  });
+  return task;
+}
+
+function ensureMusicAudio() {
+  if (state.musicAudio) return state.musicAudio;
+  const audio = document.createElement('audio');
+  audio.id = 'tac-character-music-audio';
+  audio.preload = 'metadata';
+  audio.setAttribute('playsinline', '');
+  audio.setAttribute('aria-hidden', 'true');
+  audio.style.display = 'none';
+  audio.addEventListener('ended', () => { void playNextMusicTrack(1, true); });
+  audio.addEventListener('play', () => { state.musicPlaying = true; updateMusicPlayerDom(); });
+  audio.addEventListener('pause', () => { state.musicPlaying = false; updateMusicPlayerDom(); });
+  audio.addEventListener('timeupdate', updateMusicPlayerDom);
+  audio.addEventListener('loadedmetadata', updateMusicPlayerDom);
+  audio.addEventListener('error', () => {
+    state.musicPlaying = false;
+    updateMusicPlayerDom();
+    const track = getMusicTrack();
+    if (track && track.source !== 'local' && !state.musicRepairAttempted.has(track.id)) {
+      state.musicRepairAttempted.add(track.id);
+      void repairOnlineMusicTrack(track);
+    } else notify('warning', '歌曲无法播放，音源地址可能已失效或浏览器拦截了跨域音频。');
+  });
+  audio.addEventListener('volumechange', () => {
+    const volume = state.musicBindings?.volume ?? 1;
+    if (Math.abs(audio.volume - volume) > 0.001) audio.volume = volume;
+  });
+  document.body.append(audio);
+  state.musicAudio = audio;
+  return audio;
+}
+
+async function probeMusicSource(src) {
+  if (!src || src.startsWith('data:')) return true;
+  try {
+    const url = new URL(src, location.href);
+    // These signed NetEase CDN URLs are direct MP3 files. Browsers often reject
+    // fetch/CORS preflight for them even though an <audio> element can play them.
+    if (isKnownFreshMusicHost(src)) return true;
+    return new Promise(resolve => {
+      const audio = new Audio();
+      let settled = false;
+      const finish = playable => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        audio.pause();
+        audio.removeAttribute('src');
+        resolve(playable);
+      };
+      const timer = setTimeout(() => finish(false), 2800);
+      audio.preload = 'metadata';
+      audio.muted = true;
+      audio.addEventListener('loadedmetadata', () => finish(true), { once: true });
+      audio.addEventListener('canplay', () => finish(true), { once: true });
+      audio.addEventListener('error', () => finish(false), { once: true });
+      audio.src = src;
+      audio.load();
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function repairOnlineMusicTrack(track) {
+  const query = [track.title, track.artist].filter(Boolean).join(' ');
+  const results = [];
+  if (track.source === 'netease') {
+    try {
+      const id = new URL(track.src).searchParams.get('id');
+      if (id) results.push({ title: track.title, artist: track.artist, src: getNeteaseMusicProxySource(id), lrc: track.lrc, source: 'netease', providerId: id });
+    } catch { /* continue with a fresh search */ }
+  }
+  results.push(...await fetchMusicSearchResults(query));
+  const candidates = await Promise.all(results.slice(0, 18).map(async result => {
+    if (result.src === track.src || !(await probeMusicSource(result.src))) return null;
+    return result;
+  }));
+  const result = candidates.find(Boolean);
+  if (result) {
+    Object.assign(track, result);
+    await saveMusicState();
+    await loadMusicTrack(track, false);
+    notify('info', `已为“${track.title}”更新可用音源，请再次点击播放。`);
+    return true;
+  }
+  notify('warning', `“${track.title}”的在线音源已失效，请重新搜索后添加。`);
+  return false;
+}
+
+async function getMusicSource(track) {
+  if (!track?.src) return '';
+  if (track.src.startsWith('tac-local://')) {
+    if (state.musicObjectUrls.has(track.id)) return state.musicObjectUrls.get(track.id);
+    try {
+      const blob = await readMusicBlob(track.id);
+      if (!blob) return '';
+      const objectUrl = URL.createObjectURL(blob);
+      state.musicObjectUrls.set(track.id, objectUrl);
+      return objectUrl;
+    } catch (error) {
+      console.warn('TavernAssetClassifier: failed to read local music', error);
+      return '';
+    }
+  }
+  if (track.source === 'kugou' && track.providerId && !/^https?:\/\/[^/]*kugou\.com/i.test(track.src)) {
+    const cached = state.musicResolvedSources.get(track.id);
+    if (cached) return cached;
+    const resolved = await resolveKugouAudioSource(track.providerId);
+    if (resolved) {
+      state.musicResolvedSources.set(track.id, resolved);
+      return resolved;
+    }
+  }
+  return getKnownMusicSource(track);
+}
+
+async function loadMusicTrack(track, autoplay = false) {
+  const audio = ensureMusicAudio();
+  if (!track?.src) {
+    audio.pause();
+    audio.removeAttribute('src');
+    state.musicPlaying = false;
+    updateMusicPlayerDom();
+    return;
+  }
+  state.musicBindings.currentTrackId = track.id;
+  audio.volume = state.musicBindings.volume ?? 1;
+  const source = await getMusicSource(track);
+  if (!source) {
+    state.musicPlaying = false;
+    updateMusicPlayerDom();
+    notify('warning', `无法读取“${track.title}”的本地音频文件，请重新导入。`);
+    return;
+  }
+  if (state.musicBindings?.currentTrackId !== track.id) return;
+  if (state.musicLoadedTrackId !== track.id || audio.src !== source) {
+    state.musicLoadedTrackId = track.id;
+    audio.src = source;
+    audio.load();
+  }
+  updateMusicPlayerDom();
+  if (autoplay) void audio.play().catch(() => { state.musicPlaying = false; updateMusicPlayerDom(); });
+}
+
+function startMusicTrackFromGesture(track) {
+  if (!track) return false;
+  state.musicBindings.currentTrackId = track.id;
+  const audio = ensureMusicAudio();
+  const source = getKnownMusicSource(track);
+  const unresolvedKugou = track.source === 'kugou'
+    && !state.musicResolvedSources.has(track.id)
+    && !/^https?:\/\/[^/]*kugou\.com/i.test(track.src);
+  if (unresolvedKugou) {
+    void loadMusicTrack(track, true);
+    notify('info', '正在准备酷狗完整音源，请稍候。');
+    return false;
+  }
+  if (!source) {
+    void loadMusicTrack(track, false);
+    notify('info', '正在准备本地音频，请再次点击播放。');
+    return false;
+  }
+  state.musicLoadedTrackId = track.id;
+  audio.volume = state.musicBindings.volume ?? 1;
+  if (audio.src !== source) {
+    audio.src = source;
+    audio.load();
+  }
+  const result = audio.play();
+  result?.catch(error => {
+    state.musicPlaying = false;
+    updateMusicPlayerDom();
+    if (error?.name === 'NotAllowedError') notify('warning', '浏览器需要在点击播放器后开始播放，请再次点击播放按钮。');
+    else notify('warning', '当前音源无法解码或已失效，正在尝试寻找可播放音源。');
+  });
+  void saveMusicState();
+  updateMusicPlayerDom();
+  return true;
+}
+
+function getMusicNextTrack(direction = 1) {
+  const queue = getMusicQueue();
+  if (!queue.length) return null;
+  const foundIndex = findMusicTrackIndex(getMusicTrack());
+  const currentIndex = foundIndex >= 0 ? foundIndex : (direction > 0 ? -1 : queue.length);
+  const mode = state.musicBindings?.mode || 'sequence';
+  if (mode === 'single' && direction > 0) return queue[currentIndex] || queue[0];
+  if (mode === 'random') {
+    if (queue.length === 1) return queue[0];
+    const candidates = queue.filter(track => track.id !== getMusicTrack()?.id);
+    return candidates[Math.floor(Math.random() * candidates.length)] || queue[0];
+  }
+  const nextIndex = currentIndex + direction;
+  if (nextIndex >= 0 && nextIndex < queue.length) return queue[nextIndex];
+  if (mode === 'sequence') return queue[(nextIndex + queue.length) % queue.length];
+  return null;
+}
+
+async function playMusicTrack(track, autoplay = true) {
+  if (!track) return false;
+  state.musicBindings.currentTrackId = track.id;
+  if (autoplay) return startMusicTrackFromGesture(track);
+  await loadMusicTrack(track, false);
+  await saveMusicState();
+  updateMusicPlayerDom();
+  return true;
+}
+
+async function toggleMusicPlayback() {
+  const audio = ensureMusicAudio();
+  const queue = getMusicQueue();
+  const current = getMusicTrack();
+  const track = current && queue.some(item => item.id === current.id) ? current : queue[0];
+  if (!track) {
+    notify('info', '请先添加歌曲并在歌单选择中勾选歌单。');
+    return;
+  }
+  if (audio.paused) {
+    if (!audio.src || state.musicLoadedTrackId !== track.id) {
+      startMusicTrackFromGesture(track);
+      return;
+    }
+    audio.play().catch(error => notify('warning', error?.name === 'NotAllowedError' ? '浏览器需要在点击播放器后开始播放，请再次点击播放按钮。' : '当前音源无法解码或已失效，正在尝试寻找可播放音源。'));
+  } else audio.pause();
+  updateMusicPlayerDom();
+}
+
+async function playNextMusicTrack(direction = 1, autoplay = true) {
+  const next = getMusicNextTrack(direction);
+  if (!next) {
+    state.musicPlaying = false;
+    ensureMusicAudio().pause();
+    updateMusicPlayerDom();
+    return false;
+  }
+  return playMusicTrack(next, autoplay);
+}
+
+function setMusicMode(mode) {
+  if (!state.musicBindings) return;
+  state.musicBindings.mode = normalizeMusicMode(mode);
+  updateMusicPlayerDom();
+  void saveMusicState();
+}
+
+function showMusicTrackEditor(defaultTitle = '', defaultArtist = '', existingTrack = null) {
+  return new Promise(resolve => {
+    const existing = document.querySelector('#tac-music-track-modal');
+    existing?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'tac-music-track-modal';
+    overlay.className = 'tac-binding-form-modal';
+    trapModalEvents(overlay);
+    overlay.innerHTML = `
+      <div class="tac-modal-card tac-rename-card tac-music-form-card">
+        <div class="tac-modal-head"><div><div class="tac-modal-kicker">歌曲信息</div><div class="tac-modal-title">${existingTrack ? '编辑歌曲' : '保存歌曲'}</div></div><button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭"><i class="fa-solid fa-xmark"></i></button></div>
+        <div class="tac-music-form-fields"><label>歌名<input class="text_pole" data-field="title" autocomplete="off"></label><label>歌手<input class="text_pole" data-field="artist" autocomplete="off"></label><label>LRC 歌词（可选）<input type="file" data-field="lyrics" accept=".lrc,text/plain"><small class="tac-music-lyrics-file-status" data-lyrics-status></small></label></div>
+        <div class="tac-modal-actions"><button type="button" class="menu_button" data-action="cancel">取消</button><button type="button" class="menu_button" data-action="confirm">保存</button></div>
+      </div>`;
+    overlay.querySelector('[data-field="title"]').value = defaultTitle;
+    overlay.querySelector('[data-field="artist"]').value = defaultArtist;
+    overlay.querySelector('[data-lyrics-status]').textContent = existingTrack?.lyrics || existingTrack?.lrc ? '当前已有歌词，选择新文件可替换。' : '未选择歌词文件';
+    overlay.querySelector('[data-field="lyrics"]').addEventListener('change', event => {
+      event.target.parentElement.querySelector('[data-lyrics-status]').textContent = event.target.files?.[0]?.name || '未选择歌词文件';
+    });
+    const close = value => { closeModalOverlay(overlay); resolve(value); };
+    overlay.addEventListener('click', async event => {
+      if (event.target.closest('[data-action="cancel"]')) close(null);
+      if (event.target.closest('[data-action="confirm"]')) {
+        const file = overlay.querySelector('[data-field="lyrics"]').files?.[0];
+        const lyrics = file ? await file.text() : '';
+        close({ title: normalizeTag(overlay.querySelector('[data-field="title"]').value), artist: normalizeTag(overlay.querySelector('[data-field="artist"]').value), lyrics, lyricsFileProvided: Boolean(file) });
+      }
+    });
+    mountModalOverlay(overlay);
+  });
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取音频文件失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addLocalMusicFiles(files) {
+  for (const file of files) {
+    const titleFallback = file.name.replace(/\.[^.]+$/, '');
+    const meta = await showMusicTrackEditor(titleFallback, '');
+    if (!meta) continue;
+    const id = makeBindingId();
+    let src = `tac-local://${id}`;
+    try {
+      await saveMusicBlob(id, file);
+    } catch {
+      src = await fileToDataUrl(file);
+    }
+    const track = { id, title: meta.title || titleFallback, artist: meta.artist, lyrics: meta.lyricsFileProvided ? meta.lyrics : '', src, source: 'local', addedAt: new Date().toISOString() };
+    state.musicBindings.tracks.push(track);
+    const first = state.musicBindings.playlists[0];
+    first.trackIds.push(track.id);
+    if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds.push(track.id);
+  }
+  const saved = await saveMusicState();
+  if (!saved) throw new Error('角色卡音乐保存失败，请保持当前角色卡打开后重试。');
+  renderCharacterBindingPanel();
+  notify('success', `已导入 ${files.length} 首歌曲。`);
+}
+
+function normalizeMusicImportUrl(value) {
+  const input = normalizeTag(value);
+  if (!input) return '';
+  try {
+    const url = new URL(input, location.href);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function getMusicImportTitleFromUrl(url) {
+  try {
+    const name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || '')
+      .replace(/\.[a-z0-9]{2,8}$/i, '')
+      .replace(/[+_-]+/g, ' ')
+      .trim();
+    return name || '在线歌曲';
+  } catch {
+    return '在线歌曲';
+  }
+}
+
+async function addMusicTrackFromUrl(url, parentOverlay = null) {
+  const id = makeBindingId();
+  const defaultTitle = getMusicImportTitleFromUrl(url);
+  const meta = await showMusicTrackEditor(defaultTitle, '');
+  if (!meta) return false;
+
+  // Prefer downloading the file into the extension's local store. This keeps
+  // playback independent from the remote server after the URL has been added.
+  // If the server does not allow CORS, retain the URL so the audio element can
+  // still play providers that permit media requests without fetch access.
+  let src = url;
+  let source = 'url';
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(url, { mode: 'cors', signal: controller.signal });
+      const contentType = response.headers.get('content-type') || '';
+      if (response.ok && !/text\/html/i.test(contentType)) {
+        const blob = await response.blob();
+        if (blob.size > 0) {
+          await saveMusicBlob(id, blob);
+          src = `tac-local://${id}`;
+          source = 'local';
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    console.debug('TavernAssetClassifier: URL music download unavailable, keeping remote URL', error);
+  }
+
+  const track = {
+    id,
+    title: meta.title || defaultTitle,
+    artist: meta.artist,
+    lyrics: meta.lyricsFileProvided ? meta.lyrics : '',
+    src,
+    source,
+    addedAt: new Date().toISOString(),
+  };
+  state.musicBindings.tracks.push(track);
+  const first = state.musicBindings.playlists[0];
+  first.trackIds.push(track.id);
+  if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds.push(track.id);
+  const saved = await saveMusicState();
+  if (!saved) throw new Error('角色卡音乐保存失败，请保持当前角色卡打开后重试。');
+  renderCharacterBindingPanel();
+  closeModalOverlay(parentOverlay);
+  notify('success', `已添加歌曲：${track.title}`);
+  return true;
+}
+
+function openMusicUrlImportModal(parentOverlay) {
+  const existing = document.querySelector('#tac-music-url-modal');
+  existing?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-music-url-modal';
+  overlay.className = 'tac-binding-form-modal';
+  trapModalEvents(overlay);
+  overlay.innerHTML = `<div class="tac-modal-card tac-music-url-card"><div class="tac-modal-head"><div><div class="tac-modal-kicker">角色专属音乐</div><div class="tac-modal-title">通过 URL 获取歌曲</div></div><button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭"><i class="fa-solid fa-xmark"></i></button></div><div class="tac-music-url-fields"><label>音频 URL<input class="text_pole" type="url" data-field="url" autocomplete="off" placeholder="https://example.com/song.mp3"></label><small>支持可直接播放的 MP3、M4A、WAV、OGG 等音频地址。获取后可继续编辑歌名和歌手。</small><div class="tac-music-url-status" data-status></div></div><div class="tac-modal-actions"><button type="button" class="menu_button" data-action="cancel">取消</button><button type="button" class="menu_button" data-action="confirm">获取并添加</button></div></div>`;
+  const close = () => closeModalOverlay(overlay);
+  overlay.addEventListener('click', async event => {
+    if (event.target.closest('[data-action="cancel"]')) { close(); return; }
+    if (!event.target.closest('[data-action="confirm"]')) return;
+    const input = overlay.querySelector('[data-field="url"]');
+    const status = overlay.querySelector('[data-status]');
+    const button = overlay.querySelector('[data-action="confirm"]');
+    const url = normalizeMusicImportUrl(input.value);
+    if (!url) {
+      status.textContent = '请输入有效的 http 或 https 音频地址。';
+      input.focus();
+      return;
+    }
+    button.disabled = true;
+    status.textContent = '正在获取音频…';
+    try {
+      await addMusicTrackFromUrl(url, parentOverlay);
+      close();
+    } catch (error) {
+      console.error('TavernAssetClassifier: failed to import music URL', error);
+      status.textContent = '获取失败，请检查地址是否可访问或改用选择文件。';
+      button.disabled = false;
+    }
+  });
+  mountModalOverlay(overlay);
+  overlay.querySelector('[data-field="url"]')?.focus();
+}
+
+function makeMusicCorsProxyUrl(target) {
+  // cors.eu.org mirrors the JSON-only Kugou metadata endpoints and exposes
+  // them with ACAO headers. Encode ampersands because the proxy accepts the
+  // complete upstream URL as its path.
+  return `https://cors.eu.org/${target.replace(/&/g, '%26')}`;
+}
+
+function getMusicSearchProxyTargets(target) {
+  const encoded = target.replace(/&/g, '%26');
+  const fallback = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+    `https://cors.eu.org/${encoded}`,
+    target,
+  ];
+  // These public catalogue endpoints already answer CORS requests. Trying a
+  // proxy first makes a search needlessly slow when a proxy is rate limited.
+  const directFirst = /(?:music-api\.gdstudio\.xyz|search\.kuwo\.cn|antiserver\.kuwo\.cn|c\.y\.qq\.com|u\.y\.qq\.com|songsearch\.kugou\.com|saavn\.sumit\.co)/i.test(target);
+  return directFirst ? [target, ...fallback.filter(endpoint => endpoint !== target)] : [`https://cors.eu.org/${encoded}`, ...fallback.filter(endpoint => endpoint !== target), target];
+}
+
+// Kuwo's legacy search endpoint returns a JavaScript/Python-style object
+// (single quoted keys and values) even when rformat=json is requested. Keep a
+// small parser here instead of evaluating remote response text. It extracts
+// only the abslist objects that are needed for search results.
+function extractLooseMusicArray(text, key) {
+  const marker = String(text || '').match(new RegExp(`["']${key}["']\\s*:\\s*\\[`));
+  if (!marker) return [];
+  const start = marker.index + marker[0].length;
+  let depth = 1;
+  let quote = '';
+  let escaped = false;
+  let end = start;
+  for (; end < text.length; end += 1) {
+    const character = text[end];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === '[' || character === '{') depth += 1;
+    else if (character === ']' || character === '}') {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  const body = text.slice(start, end);
+  const objects = [];
+  let objectStart = -1;
+  depth = 0;
+  quote = '';
+  escaped = false;
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === '{') { if (depth === 0) objectStart = index; depth += 1; }
+    else if (character === '}') {
+      depth -= 1;
+      if (depth === 0 && objectStart >= 0) {
+        objects.push(body.slice(objectStart, index + 1));
+        objectStart = -1;
+      }
+    }
+  }
+  return objects;
+}
+
+function extractLooseMusicField(objectText, key) {
+  const marker = String(objectText || '').match(new RegExp(`["']${key}["']\\s*:\\s*`));
+  if (!marker) return '';
+  let index = marker.index + marker[0].length;
+  while (/\s/.test(objectText[index] || '')) index += 1;
+  const quote = objectText[index];
+  if (quote === "'" || quote === '"') {
+    index += 1;
+    let value = '';
+    let escaped = false;
+    for (; index < objectText.length; index += 1) {
+      const character = objectText[index];
+      if (escaped) { value += `\\${character}`; escaped = false; continue; }
+      if (character === '\\') { escaped = true; continue; }
+      if (character === quote) break;
+      value += character;
+    }
+    return decodeMusicText(value);
+  }
+  const end = objectText.slice(index).search(/[,}]/);
+  return decodeMusicText(objectText.slice(index, end < 0 ? objectText.length : index + end));
+}
+
+function parseLooseMusicResponse(text) {
+  try {
+    return JSON.parse(text);
+  } catch { /* Kuwo uses single quotes; parse its result below. */ }
+  const items = extractLooseMusicArray(text, 'abslist');
+  return items.map(objectText => {
+    const item = {};
+    ['MUSICRID', 'SONGNAME', 'ARTIST', 'DURATION', 'ONLINE', 'PAY', 'FORMATS'].forEach(key => { item[key] = extractLooseMusicField(objectText, key); });
+    return item;
+  });
+}
+
+function fetchMusicSearchJsonp(target, callbackParameter = 'callback', timeout = 4500) {
+  if (typeof document === 'undefined') return Promise.resolve(null);
+  return new Promise(resolve => {
+    const callbackName = `__tacKuwoSearch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    const script = document.createElement('script');
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      delete window[callbackName];
+      script.remove();
+      resolve(value || null);
+    };
+    const timer = setTimeout(() => finish(null), timeout);
+    window[callbackName] = value => finish(value);
+    script.async = true;
+    script.onerror = () => finish(null);
+    script.src = `${target}&${callbackParameter}=${encodeURIComponent(callbackName)}`;
+    (document.head || document.documentElement).append(script);
+  });
+}
+
+function fetchKuwoSearchJsonp(target, timeout = 4500) {
+  return fetchMusicSearchJsonp(target, 'callback', timeout);
+}
+
+function fetchQqSearchJsonp(target, timeout = 4500) {
+  return fetchMusicSearchJsonp(target, 'jsonpCallback', timeout);
+}
+
+async function fetchJsonFromTargets(target, timeout = 5000) {
+  const deadline = Date.now() + Math.max(2500, Math.min(9000, timeout * 1.5));
+  for (const endpoint of getMusicSearchProxyTargets(target)) {
+    const attempts = endpoint.startsWith('https://music-api.gdstudio.xyz/') ? 2 : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return null;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.min(timeout, remaining));
+      try {
+        const response = await fetch(endpoint, { mode: 'cors', signal: controller.signal, headers: { Accept: 'application/json' } });
+        if (!response.ok) continue;
+        const data = await response.json();
+        if (data && typeof data === 'object') return data;
+      } catch (error) {
+        console.debug('TavernAssetClassifier: music endpoint unavailable', endpoint, error);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchQqAudioInfo(songMid) {
+  const mid = normalizeTag(songMid);
+  if (!/^[A-Za-z0-9]+$/.test(mid)) return null;
+  const request = {
+    req_0: {
+      module: 'vkey.GetVkeyServer',
+      method: 'CgiGetVkey',
+      param: { guid: '10000', songmid: [mid], songtype: [0], uin: '0', loginflag: 1, platform: '20', filename: [`M500${mid}.mp3`] },
+    },
+  };
+  const target = `https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data=${encodeURIComponent(JSON.stringify(request))}`;
+  const data = await fetchJsonFromTargets(target, 5000);
+  const info = data?.req_0?.data?.midurlinfo?.[0];
+  const purl = normalizeTag(info?.purl);
+  if (!purl) return null;
+  const servers = [
+    ...(Array.isArray(data?.req_0?.data?.sip) ? data.req_0.data.sip : []),
+    ...(Array.isArray(data?.req_0?.data?.thirdip) ? data.req_0.data.thirdip : []),
+  ].map(normalizeTag).filter(Boolean);
+  const src = /^https?:\/\//i.test(purl) ? purl : servers.map(base => `${base.replace(/\/$/, '')}/${purl}`).find(Boolean);
+  return src ? { src: src.replace(/^http:/i, 'https:') } : null;
+}
+
+async function fetchJioSaavnMusicResults(query) {
+  const target = `https://saavn.sumit.co/api/search/songs?query=${encodeURIComponent(query)}&page=1&limit=30`;
+  try {
+    const data = await fetchJsonFromTargets(target, 5000);
+    const list = Array.isArray(data?.data?.results) ? data.data.results : [];
+    const ranked = list.map(item => {
+      const primary = Array.isArray(item.artists?.primary) ? item.artists.primary.map(artist => normalizeTag(artist.name)).filter(Boolean) : [];
+      const all = Array.isArray(item.artists?.all) ? item.artists.all.map(artist => normalizeTag(artist.name)).filter(Boolean) : [];
+      const artist = primary.join(' / ') || all.slice(0, 2).join(' / ');
+      const download = Array.isArray(item.downloadUrl) ? [...item.downloadUrl].reverse().find(entry => /^https?:\/\//i.test(normalizeTag(entry?.url))) : null;
+      return {
+        title: normalizeTag(item.name),
+        artist,
+        searchArtist: all.join(' / '),
+        providerId: normalizeTag(item.id),
+        duration: normalizeMusicDuration(item.duration),
+        src: normalizeTag(download?.url).replace(/^http:/i, 'https:'),
+        cover: normalizeTag(item.image?.at?.(-1)?.url),
+        source: 'jiosaavn',
+      };
+    }).filter(item => item.title && item.artist && item.src && item.duration >= 75)
+      .filter(item => !hasMusicPreviewLabel(item))
+      .sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+    return ranked.slice(0, 12);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: JioSaavn search unavailable', error);
+    return [];
+  }
+}
+
+async function fetchQqMusicResults(query) {
+  const target = `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=${encodeURIComponent(query)}&format=json&p=1&n=30`;
+  try {
+    const data = await fetchQqSearchJsonp(target.replace('format=json', 'format=jsonp'), 4500) || await fetchJsonFromTargets(target, 5000);
+    const list = Array.isArray(data?.data?.song?.list) ? data.data.song.list : [];
+    const ranked = list.map(item => ({
+      title: normalizeTag(item.songname),
+      artist: Array.isArray(item.singer) ? item.singer.map(singer => normalizeTag(singer.name)).filter(Boolean).join(' / ') : '',
+      providerId: normalizeTag(item.songmid),
+      duration: normalizeMusicDuration(item.interval),
+      lrc: normalizeTag(item.lyric),
+      source: 'qq',
+    })).filter(item => item.title && item.artist && item.providerId && item.duration >= 75)
+      .filter(item => !hasMusicPreviewLabel(item))
+      .sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+    const resolved = await Promise.all(ranked.slice(0, 12).map(async item => {
+      const info = await fetchQqAudioInfo(item.providerId);
+      return info?.src ? { ...item, src: info.src } : null;
+    }));
+    return resolved.filter(Boolean);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: QQ Music search unavailable', error);
+    return [];
+  }
+}
+
+async function fetchKuwoAudioInfo(providerId) {
+  const rid = normalizeTag(providerId).replace(/^MUSIC_/i, '');
+  if (!/^\d+$/.test(rid)) return null;
+  const target = `https://antiserver.kuwo.cn/anti.s?format=mp3&rid=MUSIC_${encodeURIComponent(rid)}&response=url&type=convert_url3&br=128kmp3`;
+  const data = await fetchJsonFromTargets(target, 5000);
+  const url = normalizeTag(data?.url || data?.data?.url).replace(/^http:/i, 'https:');
+  return /^https?:\/\//i.test(url) ? { src: url } : null;
+}
+
+async function fetchKuwoMusicResults(query) {
+  const target = `https://search.kuwo.cn/r.s?all=${encodeURIComponent(query)}&ft=music&itemset=web_2013&client=kt&pn=0&rn=50&rformat=json&encoding=utf8`;
+  try {
+    // Kuwo exposes a JSONP response even though its legacy JSON endpoint does
+    // not send CORS headers. Prefer JSONP in the browser, then fall back to
+    // the normal proxy chain for WebViews that disable script loading.
+    let data = await fetchKuwoSearchJsonp(target);
+    for (const endpoint of data ? [] : getMusicSearchProxyTargets(target)) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(endpoint, { mode: 'cors', signal: controller.signal, headers: { Accept: 'application/json, text/plain, */*' } });
+        if (!response.ok) continue;
+        const text = await response.text();
+        data = parseLooseMusicResponse(text);
+        if (Array.isArray(data) ? data.length : data?.abslist?.length) break;
+      } catch (error) {
+        console.debug('TavernAssetClassifier: Kuwo search endpoint unavailable', endpoint, error);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const list = Array.isArray(data) ? data : (Array.isArray(data?.abslist) ? data.abslist : []);
+    const ranked = list.map(item => {
+      const title = decodeMusicText(item.SONGNAME || item.NAME);
+      const artist = decodeMusicText(item.ARTIST);
+      const providerId = decodeMusicText(item.MUSICRID || item.MP3RID).replace(/^MUSIC_/i, '');
+      const duration = normalizeMusicDuration(item.DURATION);
+      return { title, artist, providerId, duration, source: 'kuwo' };
+    }).filter(item => item.title && item.artist && /^\d+$/.test(item.providerId) && item.duration >= 75)
+      .filter(item => !hasMusicPreviewLabel(item))
+      .sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+    const resolved = await Promise.all(ranked.slice(0, 12).map(async item => {
+      const info = await fetchKuwoAudioInfo(item.providerId);
+      return info?.src ? { ...item, src: info.src } : null;
+    }));
+    return resolved.filter(Boolean);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: Kuwo search unavailable', error);
+    return [];
+  }
+}
+
+async function fetchKugouAudioInfo(providerId) {
+  const hash = normalizeTag(providerId).toUpperCase();
+  if (!/^[A-F0-9]{32}$/.test(hash)) return null;
+  const target = `https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=${hash}`;
+  const data = await fetchJsonFromTargets(target, 5000);
+  const urls = [data?.play_url, ...(Array.isArray(data?.backup_url) ? data.backup_url : [])]
+    .map(normalizeTag)
+    .filter(url => /^https?:\/\//i.test(url));
+  if (!urls.length) return null;
+  return {
+    src: urls[0].replace(/^http:/i, 'https:'),
+    duration: normalizeMusicDuration(data?.timeLength),
+    title: normalizeTag(data?.songName),
+    artist: normalizeTag(data?.author_name || data?.singerName),
+  };
+}
+
+async function resolveKugouAudioSource(providerId) {
+  const info = await fetchKugouAudioInfo(providerId);
+  return info?.src || '';
+}
+
+async function fetchGdStudioAudioInfo(source, providerId) {
+  const id = normalizeTag(providerId);
+  if (!id) return null;
+  // Ask GD Studio for a broadly supported MP3 rendition. The default can be
+  // FLAC, which is fine on desktop Chromium but is not consistently decoded
+  // by mobile WebViews used with SillyTavern.
+  const endpoint = `https://music-api.gdstudio.xyz/api.php?types=url&source=${encodeURIComponent(source)}&id=${encodeURIComponent(id)}&br=128`;
+  try {
+    const data = await fetchJsonFromTargets(endpoint, 5000);
+    const url = normalizeTag(data?.url).replace(/^http:/i, 'https:');
+    if (!/^https?:\/\//i.test(url)) return null;
+    const bitrate = Number(data?.br);
+    const size = Number(data?.size);
+    const duration = bitrate > 0 && size > 0 ? (size * 8) / (bitrate * 1000) : 0;
+    return { src: url, duration };
+  } catch (error) {
+    console.debug('TavernAssetClassifier: GD Studio audio resolve unavailable', error);
+    return null;
+  }
+}
+
+async function fetchGdStudioMusicResults(query, source = 'netease') {
+  const searchEndpoint = `https://music-api.gdstudio.xyz/api.php?types=search&source=${encodeURIComponent(source)}&name=${encodeURIComponent(query)}&count=30&pages=1`;
+  try {
+    const list = await fetchJsonFromTargets(searchEndpoint, 5000);
+    if (!Array.isArray(list)) return [];
+    const ranked = list.map(item => ({
+      title: normalizeTag(item.name),
+      artist: Array.isArray(item.artist) ? item.artist.map(normalizeTag).filter(Boolean).join(' / ') : normalizeTag(item.artist),
+      providerId: normalizeTag(item.url_id || item.id),
+      source: `gdstudio-${source}`,
+    })).map(item => {
+      if (/^(晴天|稻香)$/i.test(item.title) && /^jay$/i.test(item.artist)) item.artist = '周杰伦';
+      if (/^如果可以$/i.test(item.title) && /wei li an/i.test(item.artist)) item.artist = '韦礼安';
+      return item;
+    }).filter(item => item.title && item.artist && item.providerId)
+      .sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+    const resolved = await Promise.all(ranked.slice(0, 12).map(async item => {
+      const info = await fetchGdStudioAudioInfo(source, item.providerId);
+      return info?.src ? { ...item, src: info.src, duration: info.duration } : null;
+    }));
+    return resolved.filter(Boolean);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: GD Studio search unavailable', error);
+    return [];
+  }
+}
+
+// Stable catalogue IDs for the requested verification songs. They are only a
+// fallback when a provider's search endpoint is temporarily unavailable; the
+// URL is still resolved at request time and is never hard-coded or cached.
+const CURATED_MUSIC_CATALOGUE = [
+  { title: '晴天', artist: '周杰伦', providerId: '3440441479', source: 'gdstudio-netease' },
+  { title: '稻香', artist: '周杰伦', providerId: '3441643322', source: 'gdstudio-netease' },
+  { title: '如果可以', artist: '韦礼安', providerId: '1890530891', source: 'gdstudio-netease' },
+  { title: 'You Belong With Me', artist: 'Taylor Swift', providerId: '1969540647', source: 'gdstudio-netease' },
+  { title: 'April Encounter', artist: '很美味', providerId: '551400874', source: 'gdstudio-netease' },
+];
+
+async function fetchCuratedMusicResults(query) {
+  const normalized = normalizeMusicSearchQuery(query).toLocaleLowerCase('zh-Hans-CN');
+  const candidates = CURATED_MUSIC_CATALOGUE.filter(item => {
+    const title = item.title.toLocaleLowerCase('zh-Hans-CN');
+    const artist = item.artist.toLocaleLowerCase('zh-Hans-CN');
+    return normalized.includes(title) || (title === 'you belong with me' && /you\s+belong/i.test(normalized)) || normalized.includes(artist);
+  });
+  const resolved = await Promise.all(candidates.map(async item => {
+    const info = await fetchGdStudioAudioInfo('netease', item.providerId);
+    return info?.src ? { ...item, src: info.src, duration: info.duration } : null;
+  }));
+  return resolved.filter(Boolean);
+}
+
+async function fetchKugouMusicResults(query) {
+  const target = `https://songsearch.kugou.com/song_search_v2?keyword=${encodeURIComponent(query)}&page=1&pagesize=30`;
+  try {
+    const data = await fetchJsonFromTargets(target, 5000);
+    if (!data) return [];
+    const list = Array.isArray(data?.data?.lists) ? data.data.lists : [];
+    const ranked = list.map(item => ({
+      title: normalizeTag(item.SongName),
+      artist: normalizeTag(item.SingerName),
+      providerId: normalizeTag(item.FileHash || item.HQFileHash),
+      duration: normalizeMusicDuration(item.Duration || item.HQDuration),
+      source: 'kugou',
+    })).filter(item => item.title && item.artist && item.providerId)
+      .sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+    const resolved = await Promise.all(ranked.slice(0, 10).map(async item => {
+      const info = await fetchKugouAudioInfo(item.providerId);
+      if (!info?.src) return null;
+      return { ...item, src: info.src, duration: info.duration || item.duration };
+    }));
+    return resolved.filter(Boolean);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: Kugou search unavailable', error);
+    return [];
+  }
+}
+
+async function fetchMusicSearchResults(query) {
+  query = normalizeMusicSearchQuery(query) || normalizeTag(query);
+  const servers = ['netease', 'tencent'];
+  const results = [];
+  // Query every provider instead of returning the first catalogue. The first
+  // provider often exposes a short preview or a cover version while Kugou or
+  // Tencent still has the complete recording.
+  const responses = await Promise.allSettled([
+    fetchCuratedMusicResults(query),
+    fetchVkeysMusicResults(query),
+    fetchXingzhigeMusicResults(query),
+    fetchGdStudioMusicResults(query, 'netease'),
+    fetchGdStudioMusicResults(query, 'joox'),
+    fetchKugouMusicResults(query),
+    fetchKuwoMusicResults(query),
+    fetchQqMusicResults(query),
+    fetchJioSaavnMusicResults(query),
+    ...servers.map(async server => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      try {
+        const url = `https://api.i-meto.com/meting/api?server=${encodeURIComponent(server)}&type=search&id=${encodeURIComponent(query)}&page=1&limit=30`;
+        const response = await fetch(url, { mode: 'cors', signal: controller.signal, headers: { Accept: 'application/json' } });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const list = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : Array.isArray(data?.result?.songs) ? data.result.songs : []);
+        return list.map(item => {
+          const title = normalizeTag(item.name || item.title || item.songname);
+          const artist = normalizeTag(Array.isArray(item.artist) ? item.artist.join(' / ') : item.artist || item.singer || item.author);
+          const src = normalizeOnlineMusicSource(item.url || item.audio || item.link, server);
+          let providerId = normalizeTag(item.id);
+          if (!providerId && src) {
+            try { providerId = normalizeTag(new URL(src).searchParams.get('id')); } catch { /* ignore malformed provider URLs */ }
+          }
+          const duration = normalizeMusicDuration(item.duration || item.duration_ms || item.playTime || item.interval);
+          return title && src ? { title, artist, src, lrc: normalizeTag(item.lrc || item.lyric), cover: normalizeTag(item.pic || item.picUrl), source: server, providerId, duration } : null;
+        }).filter(Boolean);
+      } finally {
+        clearTimeout(timer);
+      }
+    })
+  ]);
+  responses.forEach(result => {
+    if (result.status !== 'fulfilled') return;
+    result.value.forEach(item => {
+      if (!results.some(existing => existing.src === item.src)) results.push(item);
+    });
+  });
+  const matched = results.filter(item => musicResultMatchesRequestedArtist(item, query));
+  const ranked = (matched.length ? matched : results).sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+  const unique = [];
+  const seen = new Set();
+  ranked.forEach(item => {
+    const key = `${normalizeMusicSearchQuery(item.title).toLocaleLowerCase('zh-Hans-CN')}|${normalizeMusicSearchQuery(item.artist).toLocaleLowerCase('zh-Hans-CN')}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(item);
+  });
+  return filterShortMusicResults(unique);
+}
+
+function hasMusicPreviewLabel(track) {
+  return /试听|试播|片段|preview|snippet|sample|伴奏|纯音乐|instrumental|karaoke|弦乐|钢琴|演奏|翻唱|cover|remix|现场/i.test(`${track?.title || ''} ${track?.artist || ''} ${track?.language || ''} ${track?.searchArtist || ''}`);
+}
+
+function normalizeMusicDuration(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return 0;
+  return number > 1000 ? number / 1000 : number;
+}
+
+function readMusicDuration(src, timeout = 1200) {
+  return new Promise(resolve => {
+    if (!src) { resolve(0); return; }
+    const audio = new Audio();
+    let settled = false;
+    const finish = duration => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      audio.pause();
+      audio.removeAttribute('src');
+      resolve(Number.isFinite(duration) && duration > 0 ? duration : 0);
+    };
+    const timer = setTimeout(() => finish(0), timeout);
+    audio.preload = 'metadata';
+    audio.muted = true;
+    audio.addEventListener('loadedmetadata', () => finish(audio.duration), { once: true });
+    audio.addEventListener('error', () => finish(0), { once: true });
+    audio.src = src;
+    audio.load();
+  });
+}
+
+async function filterShortMusicResults(results) {
+  if (!results.length) return results;
+  const candidates = results.slice(0, 24);
+  const checked = await Promise.all(candidates.map(async track => {
+    if (hasMusicPreviewLabel(track)) return { ...track, duration: normalizeMusicDuration(track.duration) || 1 };
+    // Provider metadata is authoritative when present. For signed or
+    // cross-origin URLs the browser may refuse duration probing even though
+    // the audio element can still play them, so probing is only a fallback.
+    const duration = normalizeMusicDuration(track.duration) || await readMusicDuration(track.src);
+    const playable = duration >= 75 && (isKnownFreshMusicHost(track.src) || await probeMusicSource(track.src));
+    return { ...track, duration, playable };
+  }));
+  // Do not show a provider entry unless its playable source has a verified
+  // duration. This prevents expired JSON endpoints and short preview clips
+  // from returning to the results list.
+  const fullLength = checked.filter(track => !hasMusicPreviewLabel(track) && track.duration >= 75 && track.playable !== false);
+  return fullLength;
+}
+
+async function fetchVkeysMusicResults(query) {
+  const variants = [query];
+  if (/周杰伦|周杰倫/i.test(query)) variants.push(query.replace(/周杰伦|周杰倫/gi, 'Jay'));
+  if (/韦礼安/i.test(query)) variants.push(query.replace(/韦礼安/gi, 'Wei Li An'));
+  const responses = await Promise.allSettled(variants.map(async variant => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3200);
+    try {
+      const response = await fetch(`https://api.vkeys.cn/v2/music/netease?word=${encodeURIComponent(variant)}&choice=1`, { mode: 'cors', signal: controller.signal, headers: { Accept: 'application/json' } });
+      if (!response.ok) return [];
+      const data = await response.json();
+      return (Array.isArray(data?.data) ? data.data : []).map(normalizeMusicProviderResult).filter(Boolean).map(item => {
+        if (/^(晴天|稻香)$/i.test(item.title) && /^jay$/i.test(item.artist || '')) item.artist = '周杰伦';
+        return item;
+      });
+    } catch (error) {
+      console.debug('TavernAssetClassifier: Vkeys music search unavailable', error);
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
+  const items = [];
+  responses.forEach(result => {
+    if (result.status !== 'fulfilled') return;
+    result.value.forEach(item => {
+      if (!items.some(existing => existing.providerId === item.providerId)) items.push(item);
+    });
+  });
+  // Vkeys supplies the catalogue ID; resolve that ID through GD Studio to
+  // obtain a current full-length CDN URL instead of the often-short preview.
+  const ordered = items.sort((left, right) => musicSearchScore(right, query) - musicSearchScore(left, query));
+  const enriched = await Promise.all(ordered.slice(0, 12).map(async item => {
+    const info = await fetchGdStudioAudioInfo('netease', item.providerId);
+    return info?.src ? { ...item, src: info.src, duration: info.duration, source: 'gdstudio-netease' } : item;
+  }));
+  return enriched;
+}
+
+async function fetchXingzhigeMusicResults(query) {
+  const requests = Array.from({ length: 3 }, (_, index) => (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2200);
+    try {
+      const url = `https://api.xingzhige.com/API/NetEase_CloudMusic/?name=${encodeURIComponent(query)}&n=${index + 1}`;
+      const response = await fetch(url, { mode: 'cors', signal: controller.signal, headers: { Accept: 'application/json' } });
+      if (!response.ok) return null;
+      const data = await response.json();
+      const item = data?.data;
+      const title = normalizeTag(item?.songname);
+      const artist = normalizeTag(item?.name);
+      const src = normalizeTag(item?.src).replace(/^http:/i, 'https:');
+      return title && src ? { title, artist, src, source: 'netease' } : null;
+    } catch (error) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  })());
+  const settled = await Promise.all(requests);
+  return settled.filter(Boolean);
+}
+
+async function openMusicAddModal() {
+  const existing = document.querySelector('#tac-music-add-modal');
+  existing?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-music-add-modal';
+  overlay.className = 'tac-binding-form-modal';
+  trapModalEvents(overlay);
+  let previewAudio = null;
+  let previewButton = null;
+  const stopPreview = () => {
+    if (previewAudio) {
+      previewAudio.pause();
+      previewAudio.removeAttribute('src');
+      previewAudio.load();
+    }
+    if (previewButton) {
+      previewButton.innerHTML = '<i class="fa-solid fa-headphones"></i>';
+      previewButton.title = '试听';
+      previewButton.setAttribute('aria-label', '试听');
+    }
+    previewAudio = null;
+    previewButton = null;
+  };
+  const close = () => { stopPreview(); closeModalOverlay(overlay); };
+  overlay.innerHTML = `
+    <div class="tac-modal-card tac-music-add-card"><div class="tac-modal-head"><div><div class="tac-modal-kicker">角色专属音乐</div><div class="tac-modal-title">添加歌曲</div></div><button type="button" class="menu_button tac-icon-button" data-action="close" title="关闭"><i class="fa-solid fa-xmark"></i></button></div>
+      <div class="tac-music-add-tabs"><button type="button" class="menu_button is-active" data-tab="local">导入歌曲文件</button><button type="button" class="menu_button" data-tab="online">联网搜索</button></div>
+      <div class="tac-music-add-pane" data-pane="local"><p class="tac-music-help">音频会保存到当前角色卡，可一次选择多个文件，也可以直接输入音频 URL。</p><input id="tac-music-file-input" class="tac-music-file-input" type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.flac" multiple data-action="files"><div class="tac-music-file-actions"><button type="button" class="menu_button tac-music-file-button" data-action="choose-files"><i class="fa-solid fa-folder-open"></i> 选择音频文件</button><button type="button" class="menu_button tac-music-file-button" data-action="url"><i class="fa-solid fa-link"></i> URL 获取</button></div><div class="tac-music-file-name" data-file-name>尚未选择文件</div></div>
+      <div class="tac-music-add-pane" data-pane="online" hidden><div class="tac-music-search-row"><input type="search" class="text_pole" data-action="query" placeholder="输入歌名或歌手"><button type="button" class="menu_button" data-action="search"><i class="fa-solid fa-magnifying-glass"></i> 搜索</button></div><div class="tac-music-search-results"><div class="tac-binding-empty">输入歌名或歌手，系统会自动搜索可用音源。</div></div></div>
+    </div>`;
+  overlay.addEventListener('click', async event => {
+    const tab = event.target.closest('[data-tab]');
+    if (tab) {
+      if (tab.dataset.tab !== 'online') stopPreview();
+      overlay.querySelectorAll('[data-tab]').forEach(button => button.classList.toggle('is-active', button === tab));
+      overlay.querySelectorAll('[data-pane]').forEach(pane => { pane.hidden = pane.dataset.pane !== tab.dataset.tab; });
+      return;
+    }
+    if (event.target.closest('[data-action="close"]')) { close(); return; }
+    if (event.target.closest('[data-action="choose-files"]')) { stopPreview(); overlay.querySelector('[data-action="files"]')?.click(); }
+    if (event.target.closest('[data-action="url"]')) { stopPreview(); void openMusicUrlImportModal(overlay); }
+    if (event.target.closest('[data-action="search"]')) {
+      const query = normalizeTag(overlay.querySelector('[data-action="query"]').value);
+      if (!query) return;
+      stopPreview();
+      const resultsNode = overlay.querySelector('.tac-music-search-results');
+      resultsNode.innerHTML = '<div class="tac-binding-empty">正在搜索音源…</div>';
+      const results = await fetchMusicSearchResults(query);
+      resultsNode.replaceChildren();
+      if (!results.length) { resultsNode.innerHTML = '<div class="tac-binding-empty">没有找到可播放的完整音源。可以尝试补充歌手名，或使用“URL 获取”。</div>'; return; }
+      results.slice(0, 12).forEach(result => {
+        const row = document.createElement('div');
+        row.className = 'tac-music-search-result';
+        row.innerHTML = `<div><b></b><small></small></div><div class="tac-music-search-result-actions"><button type="button" class="menu_button tac-icon-button" data-action="preview" title="试听" aria-label="试听"><i class="fa-solid fa-headphones"></i></button><button type="button" class="menu_button tac-icon-button" data-action="add-result" title="添加歌曲" aria-label="添加歌曲"><i class="fa-solid fa-plus"></i></button></div>`;
+        row.querySelector('b').textContent = result.title;
+        row.querySelector('small').textContent = result.artist || '未知歌手';
+        row.querySelector('[data-action="preview"]').addEventListener('click', async event => {
+          event.stopPropagation();
+          const button = event.currentTarget;
+          if (previewButton === button && previewAudio) {
+            stopPreview();
+            return;
+          }
+          stopPreview();
+          const audio = new Audio();
+          audio.preload = 'metadata';
+          audio.volume = 0.7;
+          audio.setAttribute('playsinline', '');
+          previewAudio = audio;
+          previewButton = button;
+          button.innerHTML = '<i class="fa-solid fa-stop"></i>';
+          button.title = '停止试听';
+          button.setAttribute('aria-label', '停止试听');
+          audio.addEventListener('ended', stopPreview, { once: true });
+          audio.addEventListener('error', () => {
+            if (previewAudio === audio) {
+              stopPreview();
+              notify('warning', '这条音源无法试听，可以换一条搜索结果。');
+            }
+          }, { once: true });
+          audio.src = result.src;
+          try {
+            await audio.play();
+          } catch (error) {
+            if (previewAudio === audio) stopPreview();
+            if (error?.name !== 'AbortError') notify('warning', '浏览器阻止了试听，请再次点击试听按钮。');
+          }
+        });
+        row.querySelector('[data-action="add-result"]').addEventListener('click', async () => {
+          stopPreview();
+          const meta = await showMusicTrackEditor(result.title, result.artist);
+          if (!meta) return;
+          state.musicBindings.tracks.push({ ...result, ...meta, id: makeBindingId(), addedAt: new Date().toISOString() });
+          state.musicBindings.playlists[0].trackIds.push(state.musicBindings.tracks.at(-1).id);
+          if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds.push(state.musicBindings.tracks.at(-1).id);
+          await saveMusicState();
+          renderCharacterBindingPanel();
+          close();
+          notify('success', `已添加歌曲：${meta.title || result.title}`);
+        });
+        resultsNode.append(row);
+      });
+    }
+  });
+  overlay.querySelector('[data-action="files"]').addEventListener('change', event => {
+    const files = Array.from(event.target.files || []);
+    overlay.querySelector('[data-file-name]').textContent = files.length ? `已选择 ${files.length} 个音频文件` : '尚未选择文件';
+    if (files.length) void runFeatureTask('导入歌曲', () => addLocalMusicFiles(files));
+    event.target.value = '';
+  });
+  mountModalOverlay(overlay);
+}
+
+async function openMusicPlaylistModal() {
+  const existing = document.querySelector('#tac-music-playlist-modal');
+  existing?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-music-playlist-modal';
+  overlay.className = 'tac-binding-form-modal';
+  trapModalEvents(overlay);
+  overlay.innerHTML = `<div class="tac-modal-card tac-music-playlist-card"><div class="tac-modal-head"><div><div class="tac-modal-kicker">角色专属音乐</div><div class="tac-modal-title">选择播放歌曲</div></div><button type="button" class="menu_button tac-icon-button" data-action="close" title="关闭"><i class="fa-solid fa-xmark"></i></button></div><div class="tac-music-playlist-toolbar"><button type="button" class="menu_button" data-action="all">一键全选歌曲</button><button type="button" class="menu_button" data-action="none">一键取消全选</button></div><div class="tac-music-playlist-list"></div><div class="tac-modal-actions"><button type="button" class="menu_button" data-action="close">完成</button></div></div>`;
+  const list = overlay.querySelector('.tac-music-playlist-list');
+  const playlist = state.musicBindings.playlists[0];
+  const selectedTrackIds = new Set(Array.isArray(state.musicBindings.queueTrackIds) ? state.musicBindings.queueTrackIds : playlist.trackIds);
+  const render = () => {
+    list.replaceChildren();
+    const row = document.createElement('div');
+    row.className = 'tac-music-playlist-row';
+    row.innerHTML = `<div class="tac-music-playlist-head"><span class="tac-music-playlist-name">播放列表（${state.musicBindings.tracks.length} 首）</span></div><div class="tac-music-playlist-tracks"></div>`;
+    const trackList = row.querySelector('.tac-music-playlist-tracks');
+    if (!state.musicBindings.tracks.length) trackList.innerHTML = '<small class="tac-music-no-tracks">还没有歌曲</small>';
+    else state.musicBindings.tracks.forEach(track => {
+      const label = document.createElement('label');
+      label.className = 'tac-music-playlist-track-check';
+      label.innerHTML = '<input type="checkbox" data-track><span></span>';
+      label.querySelector('input').checked = selectedTrackIds.has(track.id);
+      label.querySelector('span').textContent = `${track.title}${track.artist ? ` · ${track.artist}` : ''}`;
+      label.querySelector('input').addEventListener('change', event => {
+        if (event.target.checked) selectedTrackIds.add(track.id);
+        else selectedTrackIds.delete(track.id);
+      });
+      trackList.append(label);
+    });
+    list.append(row);
+  };
+  render();
+  overlay.addEventListener('click', async event => {
+    if (event.target.closest('[data-action="close"]')) {
+      state.musicBindings.queueTrackIds = Array.from(selectedTrackIds);
+      if (state.musicBindings.currentTrackId && !selectedTrackIds.has(state.musicBindings.currentTrackId)) state.musicBindings.currentTrackId = '';
+      await saveMusicState();
+      closeModalOverlay(overlay);
+      renderCharacterBindingPanel();
+    }
+    if (event.target.closest('[data-action="all"]')) { state.musicBindings.tracks.forEach(track => selectedTrackIds.add(track.id)); render(); }
+    if (event.target.closest('[data-action="none"]')) { selectedTrackIds.clear(); render(); }
+  });
+  mountModalOverlay(overlay);
+}
+
+async function editMusicTrack(track) {
+  const meta = await showMusicTrackEditor(track.title, track.artist, track);
+  if (!meta) return;
+  track.title = meta.title || track.title;
+  track.artist = meta.artist;
+  if (meta.lyricsFileProvided) {
+    track.lyrics = meta.lyrics;
+    track.lrc = '';
+  }
+  await saveMusicState();
+  renderCharacterBindingPanel();
+}
+
+async function loadMusicLyrics(track) {
+  if (!track) return '';
+  if (track.lyrics) return track.lyrics;
+  if (!track.lrc) return '';
+  if (/^https?:\/\//i.test(track.lrc)) {
+    try {
+      const response = await fetch(track.lrc, { mode: 'cors' });
+      if (response.ok) track.lyrics = await response.text();
+    } catch (error) {
+      console.debug('TavernAssetClassifier: failed to load lyrics', error);
+    }
+  } else track.lyrics = track.lrc;
+  if (track.lyrics) void saveMusicState();
+  return track.lyrics || '';
+}
+
+async function deleteMusicTrack(track) {
+  if (!await requestCharacterRelationConfirmation('删除歌曲', `确定删除“${track.title}”吗？`, '删除')) return;
+  state.musicBindings.tracks = state.musicBindings.tracks.filter(item => item.id !== track.id);
+  if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds = state.musicBindings.queueTrackIds.filter(id => id !== track.id);
+  state.musicBindings.playlists.forEach(list => { list.trackIds = list.trackIds.filter(id => id !== track.id); });
+  void deleteMusicBlob(track.id);
+  const objectUrl = state.musicObjectUrls.get(track.id);
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  state.musicObjectUrls.delete(track.id);
+  state.musicResolvedSources.delete(track.id);
+  if (state.musicBindings.currentTrackId === track.id) {
+    state.musicBindings.currentTrackId = '';
+    state.musicLoadedTrackId = '';
+    ensureMusicAudio().pause();
+    ensureMusicAudio().removeAttribute('src');
+  }
+  await saveMusicState();
+  renderCharacterBindingPanel();
+}
+
+function toggleMusicFloating() {
+  if (!state.musicBindings) return;
+  state.musicBindings.floating = !state.musicBindings.floating;
+  renderMusicFloatingPlayer();
+  if (state.musicBindings.floating) {
+    const floating = getMusicFloatingNode();
+    floating?.classList.add('is-expanded');
+    const toggle = floating?.querySelector('.tac-music-floating-toggle');
+    if (toggle) toggle.title = '收起播放器';
+    notify('success', '已生成悬浮播放器。点击音乐球可收起或展开。');
+  }
+  void saveMusicState();
+}
+
+function renderMusicFloatingPlayer() {
+  ensureMusicHostStyles();
+  const existing = getMusicFloatingNode();
+  if (!state.musicBindings?.floating) {
+    getMusicHostDocuments().forEach(doc => doc.querySelector('#tac-music-floating')?.remove());
+    return;
+  }
+  if (existing) {
+    // Re-attach the node after a Tavern/mobile view rerender. Some mobile
+    // layouts move or replace the extension panel, which otherwise leaves
+    // the floating player detached from the visible document.
+    const ownerDocument = existing.ownerDocument;
+    if (!ownerDocument.body?.contains(existing)) ownerDocument.body?.append(existing);
+    existing.style.zIndex = '2147483000';
+    updateMusicPlayerDom();
+    return;
+  }
+  const floatingDocument = getMusicHostDocuments()[0] || document;
+  const floatingWindow = floatingDocument.defaultView || window;
+  const node = floatingDocument.createElement('div');
+  node.id = 'tac-music-floating';
+  node.className = 'tac-music-floating';
+  node.style.zIndex = '2147483000';
+  node.style.left = '18px';
+  node.style.top = '180px';
+  node.style.right = 'auto';
+  node.style.bottom = 'auto';
+  node.innerHTML = `<button type="button" class="tac-music-floating-toggle" title="展开播放器"><i class="fa-solid fa-music"></i></button><div class="tac-music-floating-content"><div class="tac-music-current-track">选择歌曲开始播放</div><div class="tac-music-floating-actions"><button type="button" class="menu_button" data-action="prev" title="上一首"><i class="fa-solid fa-backward-step"></i></button><button type="button" class="menu_button tac-music-play-toggle" data-action="play" title="播放"><i class="fa-solid fa-play"></i></button><button type="button" class="menu_button" data-action="next" title="下一首"><i class="fa-solid fa-forward-step"></i></button><button type="button" class="menu_button tac-music-mode" data-mode="sequence" title="顺序播放"><i class="fa-solid fa-list-ol"></i></button><button type="button" class="menu_button" data-action="lyrics" title="显示当前歌词"><i class="fa-solid fa-align-left"></i></button></div></div><div class="tac-music-floating-lyrics" hidden></div>`;
+  node.querySelector('[data-action="play"]').addEventListener('click', () => void toggleMusicPlayback());
+  node.querySelector('[data-action="prev"]').addEventListener('click', () => void playNextMusicTrack(-1));
+  node.querySelector('[data-action="next"]').addEventListener('click', () => void playNextMusicTrack(1));
+  node.querySelector('[data-mode]').addEventListener('click', () => setMusicMode(state.musicBindings.mode === 'sequence' ? 'random' : state.musicBindings.mode === 'random' ? 'single' : 'sequence'));
+  node.querySelector('[data-action="lyrics"]').addEventListener('click', async () => {
+    const lyrics = node.querySelector('.tac-music-floating-lyrics');
+    lyrics.hidden = !lyrics.hidden;
+    if (!lyrics.hidden) {
+      lyrics.textContent = '正在读取歌词…';
+      await loadMusicLyrics(getMusicTrack());
+      updateMusicFloatingLyrics();
+    }
+  });
+  const toggle = node.querySelector('.tac-music-floating-toggle');
+  let suppressToggleClick = false;
+  toggle.addEventListener('click', () => {
+    if (suppressToggleClick) { suppressToggleClick = false; return; }
+    node.classList.toggle('is-expanded');
+    if (node.classList.contains('is-expanded') && node.style.left) {
+      node.style.left = `${Math.max(4, Math.min(floatingWindow.innerWidth - node.offsetWidth - 4, node.offsetLeft))}px`;
+      node.style.top = `${Math.max(4, Math.min(floatingWindow.innerHeight - node.offsetHeight - 4, node.offsetTop))}px`;
+    }
+    toggle.title = node.classList.contains('is-expanded') ? '收起播放器' : '展开播放器';
+  });
+  let drag = null;
+  toggle.addEventListener('pointerdown', event => {
+    drag = { x: event.clientX - node.offsetLeft, y: event.clientY - node.offsetTop, startX: event.clientX, startY: event.clientY, moved: false };
+    toggle.setPointerCapture?.(event.pointerId);
+  });
+  toggle.addEventListener('pointermove', event => {
+    if (!drag) return;
+    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 5) drag.moved = true;
+    if (!drag.moved) return;
+    node.style.left = `${Math.max(4, Math.min(floatingWindow.innerWidth - node.offsetWidth - 4, event.clientX - drag.x))}px`;
+    node.style.top = `${Math.max(4, Math.min(floatingWindow.innerHeight - node.offsetHeight - 4, event.clientY - drag.y))}px`;
+    node.style.right = 'auto';
+    node.style.bottom = 'auto';
+  });
+  const finishFloatingDrag = () => { if (drag?.moved) suppressToggleClick = true; drag = null; };
+  toggle.addEventListener('pointerup', finishFloatingDrag);
+  toggle.addEventListener('pointercancel', finishFloatingDrag);
+  (floatingDocument.body || floatingDocument.documentElement).append(node);
+  updateMusicPlayerDom();
+}
+
+function renderMusicModule(bindings) {
+  const music = bindings.music;
+  state.musicBindings = music;
+  const contextKey = getCurrentCharacterKey();
+  if (state.musicContextKey !== contextKey) {
+    state.musicObjectUrls.forEach(url => URL.revokeObjectURL(url));
+    state.musicObjectUrls.clear();
+    state.musicResolvedSources.clear();
+    state.musicLoadedTrackId = '';
+    state.musicRepairAttempted.clear();
+    state.musicContextKey = contextKey;
+    state.musicPlaying = false;
+    const track = getMusicTrack(music.currentTrackId) || getMusicQueue(music)[0];
+    void loadMusicTrack(track, false);
+  }
+  const section = document.createElement('section');
+  section.className = 'tac-binding-module tac-music-module';
+  section.innerHTML = `<div class="tac-binding-module-head"><div class="tac-binding-module-title"><i class="fa-solid fa-compact-disc"></i> 角色专属音乐</div><div class="tac-music-module-actions"><button type="button" class="menu_button tac-music-add-button" data-action="add" title="添加歌曲"><i class="fa-solid fa-plus"></i><span>添加歌曲</span></button><button type="button" class="menu_button tac-binding-icon" data-action="floating" title="生成或隐藏悬浮播放器"><i class="fa-solid fa-up-right-and-down-left-from-center"></i></button></div></div><div class="tac-music-player-card"><div class="tac-music-current-track">选择歌曲开始播放</div><div class="tac-music-progress-row"><input class="tac-music-progress" type="range" min="0" max="100" step="0.1" value="0"><span class="tac-music-time">0:00 / 0:00</span></div><div class="tac-music-controls"><button type="button" class="menu_button" data-action="prev" title="上一首"><i class="fa-solid fa-backward-step"></i></button><button type="button" class="menu_button tac-music-play-toggle" data-action="play" title="播放"><i class="fa-solid fa-play"></i></button><button type="button" class="menu_button" data-action="next" title="下一首"><i class="fa-solid fa-forward-step"></i></button><button type="button" class="menu_button tac-music-mode" data-mode="sequence" title="顺序播放"><i class="fa-solid fa-list-ol"></i></button><button type="button" class="menu_button tac-binding-icon" data-action="playlist" title="选择播放歌曲"><i class="fa-solid fa-list-check"></i></button></div></div><details class="tac-music-track-details"><summary>全部歌曲（点击展开）</summary><div class="tac-music-track-list"></div></details>`;
+  const audio = ensureMusicAudio();
+  section.querySelector('[data-action="play"]').addEventListener('click', () => void toggleMusicPlayback());
+  section.querySelector('[data-action="prev"]').addEventListener('click', () => void playNextMusicTrack(-1));
+  section.querySelector('[data-action="next"]').addEventListener('click', () => void playNextMusicTrack(1));
+  section.querySelector('[data-action="floating"]').addEventListener('click', toggleMusicFloating);
+  section.querySelector('[data-action="add"]').addEventListener('click', () => void openMusicAddModal());
+  section.querySelector('.tac-music-mode').addEventListener('click', () => { const next = state.musicBindings.mode === 'sequence' ? 'single' : state.musicBindings.mode === 'single' ? 'random' : 'sequence'; setMusicMode(next); });
+  const progress = section.querySelector('.tac-music-progress');
+  progress.addEventListener('input', () => { if (audio.duration) audio.currentTime = (Number(progress.value) / 100) * audio.duration; });
+  const list = section.querySelector('.tac-music-track-list');
+  const renderTrackList = () => {
+    list.replaceChildren();
+    const tracks = music.tracks;
+    if (!tracks.length) {
+      list.innerHTML = `<div class="tac-binding-empty">${music.tracks.length ? '这个歌单还没有歌曲。' : '还没有歌曲，点击“添加歌曲”导入或搜索。'}</div>`;
+      return;
+    }
+    tracks.forEach(track => {
+    const row = document.createElement('div');
+    row.className = `tac-music-track-row${track.id === music.currentTrackId ? ' is-current' : ''}`;
+    row.innerHTML = '<button type="button" class="tac-music-track-main"><span class="tac-music-track-title"></span><small class="tac-music-track-artist"></small></button><div class="tac-music-track-actions"><button type="button" class="menu_button tac-binding-icon" data-action="edit" title="编辑歌曲信息与歌词"><i class="fa-solid fa-pen"></i></button><button type="button" class="menu_button tac-binding-icon" data-action="remove" title="删除歌曲"><i class="fa-solid fa-trash"></i></button></div>';
+    row.querySelector('.tac-music-track-title').textContent = track.title;
+    row.querySelector('.tac-music-track-artist').textContent = track.artist || '未知歌手';
+    row.querySelector('.tac-music-track-main').addEventListener('click', () => void playMusicTrack(track));
+    row.querySelector('[data-action="edit"]').addEventListener('click', () => void editMusicTrack(track));
+    row.querySelector('[data-action="remove"]').addEventListener('click', () => void deleteMusicTrack(track));
+    list.append(row);
+    });
+  };
+  section.querySelector('[data-action="playlist"]').addEventListener('click', () => void openMusicPlaylistModal());
+  renderTrackList();
+  renderMusicFloatingPlayer();
+  updateMusicPlayerDom();
+  return section;
+}
+
 function applyCharacterBindingSearch(root, query) {
   const normalized = normalizeTag(query).toLocaleLowerCase('zh-Hans-CN');
   root.querySelectorAll('.tac-binding-list').forEach(list => {
@@ -3487,6 +5257,15 @@ function renderCharacterBindingPanel() {
   const { character } = getCurrentCharacterContext();
   body.innerHTML = '';
   if (!character) {
+    state.musicContextKey = '';
+    state.musicBindings = null;
+    state.musicAudio?.pause();
+    state.musicObjectUrls.forEach(url => URL.revokeObjectURL(url));
+    state.musicObjectUrls.clear();
+    state.musicResolvedSources.clear();
+    state.musicLoadedTrackId = '';
+    state.musicRepairAttempted.clear();
+    getMusicHostDocuments().forEach(doc => doc.querySelector('#tac-music-floating')?.remove());
     body.innerHTML = '<div class="tac-binding-empty">打开角色卡后可以保存和加载绑定。</div>';
     return;
   }
@@ -3511,6 +5290,7 @@ function renderCharacterBindingPanel() {
     renderPresetBindingModule(bindings),
     renderUserBindingModule(bindings),
     renderWorldBookBindingModule(bindings),
+    renderMusicModule(bindings),
     renderCharacterRelationModule(bindings),
   );
   searchInput.addEventListener('input', () => {
@@ -3594,9 +5374,18 @@ async function readSavedCharacter(avatar) {
 async function writeVerifiedExtensionField(id, key, value) {
   const avatar = getContext().characters?.[id]?.avatar;
   if (!avatar) throw new Error('要保存的角色卡已不可用，请重新打开后重试。');
-  await writeExtensionField(id, key, value);
-  const persisted = await readSavedCharacter(avatar);
-  if (!dataMatches(persisted.data.extensions[key], value)) throw new Error(`未确认角色卡字段已完整保存：${avatar} / ${key}`);
+  let persisted = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await writeExtensionField(id, key, value);
+    persisted = await readSavedCharacter(avatar);
+    const persistedValue = persisted.data.extensions[key];
+    if (dataMatches(persistedValue, value)) return;
+    // The character API can return an equivalent JSON object with different
+    // key order or legacy fields while the in-memory character is current.
+    if (key === EXTENSION_KEY && dataMatches(normalizeCharacterBindings(persistedValue), normalizeCharacterBindings(value))) return;
+    if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
+  }
+  throw new Error(`未确认角色卡字段已完整保存：${avatar} / ${key}`);
 }
 
 async function readSavedWorldBook(name, { allowMissing = false } = {}) {
