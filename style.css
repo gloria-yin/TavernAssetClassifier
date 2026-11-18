@@ -1154,6 +1154,7 @@ body.tac-modal-open {
 #tac-binding-modal,
 #tac-music-add-modal,
 #tac-music-url-modal,
+#tac-music-batch-modal,
 #tac-music-track-modal,
 #tac-music-playlist-modal,
 #tac-music-track-playlist-modal {
@@ -1173,6 +1174,7 @@ html > #tac-rename-modal,
 html > #tac-binding-modal,
 html > #tac-music-add-modal,
 html > #tac-music-url-modal,
+html > #tac-music-batch-modal,
 html > #tac-music-track-modal,
 html > #tac-music-playlist-modal,
 html > #tac-music-track-playlist-modal {
@@ -1530,6 +1532,7 @@ html > #tac-music-track-playlist-modal {
   #tac-binding-modal,
   #tac-music-add-modal,
   #tac-music-url-modal,
+  #tac-music-batch-modal,
   #tac-music-track-modal,
   #tac-music-playlist-modal,
   #tac-music-track-playlist-modal {
@@ -1555,6 +1558,7 @@ html > #tac-music-track-playlist-modal {
   #tac-binding-modal .tac-modal-card,
   #tac-music-add-modal .tac-modal-card,
   #tac-music-url-modal .tac-modal-card,
+  #tac-music-batch-modal .tac-modal-card,
   #tac-music-track-modal .tac-modal-card,
   #tac-music-playlist-modal .tac-modal-card,
   #tac-music-track-playlist-modal .tac-modal-card {
@@ -1573,6 +1577,7 @@ html > #tac-music-track-playlist-modal {
 
   #tac-music-add-modal.tac-binding-form-modal,
   #tac-music-url-modal.tac-binding-form-modal,
+  #tac-music-batch-modal.tac-binding-form-modal,
   #tac-music-track-modal.tac-binding-form-modal,
   #tac-music-playlist-modal.tac-binding-form-modal,
   #tac-music-track-playlist-modal.tac-binding-form-modal {
@@ -1884,7 +1889,8 @@ html > #tac-music-track-playlist-modal {
 
 .tac-music-add-card,
 .tac-music-playlist-card,
-.tac-music-url-card {
+.tac-music-url-card,
+.tac-music-batch-card {
   width: min(620px, calc(100vw - 24px));
 }
 
@@ -1996,13 +2002,34 @@ html > #tac-music-track-playlist-modal {
   padding: 12px;
 }
 
+.tac-music-batch-fields {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
 .tac-music-url-fields label {
   display: grid;
   gap: 5px;
   font-size: .86em;
 }
 
+.tac-music-batch-fields label {
+  display: grid;
+  gap: 5px;
+  font-size: .86em;
+}
+
+.tac-music-batch-fields textarea {
+  width: 100%;
+  min-height: 180px;
+  box-sizing: border-box;
+  resize: vertical;
+  line-height: 1.5;
+}
+
 .tac-music-url-fields small,
+.tac-music-batch-fields small,
 .tac-music-url-status {
   color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 62%, transparent);
   font-size: .8em;

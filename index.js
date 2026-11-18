@@ -131,7 +131,7 @@ function trapModalEvents(overlay) {
 
 function closeModalOverlay(overlay) {
   overlay.remove();
-  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-binding-modal, #tac-music-add-modal, #tac-music-url-modal, #tac-music-track-modal, #tac-music-playlist-modal, #tac-music-track-playlist-modal')) {
+  if (!document.querySelector('#tac-tag-modal, #tac-rename-modal, #tac-binding-modal, #tac-music-add-modal, #tac-music-url-modal, #tac-music-batch-modal, #tac-music-track-modal, #tac-music-playlist-modal, #tac-music-track-playlist-modal')) {
     document.body.classList.remove('tac-modal-open');
     document.documentElement.classList.remove('tac-modal-open');
   }
@@ -4099,6 +4099,80 @@ async function addMusicTrackFromUrl(url, parentOverlay = null) {
   return true;
 }
 
+async function addMusicTracksFromBatch(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line, index) => ({ value: line.trim(), lineNumber: index + 1 }))
+    .filter(item => item.value);
+  if (!lines.length) throw new Error('请先粘贴歌曲数据。');
+
+  const tracks = [];
+  const skipped = [];
+  lines.forEach(({ value: line, lineNumber }) => {
+    const fields = line.split('::');
+    const title = normalizeTag(fields.shift());
+    const artist = normalizeTag(fields.shift());
+    const url = normalizeMusicImportUrl(fields.join('::'));
+    if (!title || !url) {
+      skipped.push(lineNumber);
+      return;
+    }
+    tracks.push({
+      id: makeBindingId(),
+      title,
+      artist,
+      src: url,
+      source: 'url',
+      addedAt: new Date().toISOString(),
+    });
+  });
+  if (!tracks.length) throw new Error('没有找到有效数据，请按“歌曲::作者::url”格式填写。');
+
+  const playlist = state.musicBindings.playlists[0];
+  tracks.forEach(track => {
+    state.musicBindings.tracks.push(track);
+    playlist.trackIds.push(track.id);
+    if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds.push(track.id);
+  });
+  const saved = await saveMusicState();
+  if (!saved) throw new Error('角色卡音乐保存失败，请保持当前角色卡打开后重试。');
+  renderCharacterBindingPanel();
+  return { imported: tracks.length, skipped };
+}
+
+function openMusicBatchImportModal(parentOverlay) {
+  const existing = document.querySelector('#tac-music-batch-modal');
+  existing?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'tac-music-batch-modal';
+  overlay.className = 'tac-binding-form-modal';
+  trapModalEvents(overlay);
+  overlay.innerHTML = `<div class="tac-modal-card tac-music-batch-card"><div class="tac-modal-head"><div><div class="tac-modal-kicker">角色专属音乐</div><div class="tac-modal-title">批量导入歌曲</div></div><button type="button" class="menu_button tac-icon-button" data-action="cancel" title="关闭"><i class="fa-solid fa-xmark"></i></button></div><div class="tac-music-batch-fields"><label>歌曲列表<textarea class="text_pole" data-field="tracks" rows="8" spellcheck="false" placeholder="歌曲::作者::https://example.com/song.mp3\n另一首::另一位作者::https://example.com/other.mp3"></textarea></label><small>每行一首，格式：歌曲::作者::url。空行会跳过，url 需要是 http 或 https 地址。</small><div class="tac-music-url-status" data-status></div></div><div class="tac-modal-actions"><button type="button" class="menu_button" data-action="cancel">取消</button><button type="button" class="menu_button" data-action="confirm">批量导入</button></div></div>`;
+  const close = () => closeModalOverlay(overlay);
+  overlay.addEventListener('click', async event => {
+    if (event.target.closest('[data-action="cancel"]')) { close(); return; }
+    if (!event.target.closest('[data-action="confirm"]')) return;
+    const input = overlay.querySelector('[data-field="tracks"]');
+    const status = overlay.querySelector('[data-status]');
+    const button = overlay.querySelector('[data-action="confirm"]');
+    button.disabled = true;
+    status.textContent = '正在导入歌曲…';
+    try {
+      const result = await addMusicTracksFromBatch(input.value);
+      closeModalOverlay(parentOverlay);
+      close();
+      const skippedMessage = result.skipped.length ? `，跳过 ${result.skipped.length} 行无效数据（第 ${result.skipped.join('、')} 行）` : '';
+      notify('success', `已批量导入 ${result.imported} 首歌曲${skippedMessage}。`);
+    } catch (error) {
+      console.error('TavernAssetClassifier: failed to import music batch', error);
+      status.textContent = error?.message || '批量导入失败，请检查格式后重试。';
+      button.disabled = false;
+    }
+  });
+  mountModalOverlay(overlay);
+  overlay.querySelector('[data-field="tracks"]')?.focus();
+}
+
 function openMusicUrlImportModal(parentOverlay) {
   const existing = document.querySelector('#tac-music-url-modal');
   existing?.remove();
@@ -4754,7 +4828,7 @@ async function openMusicAddModal() {
   overlay.innerHTML = `
     <div class="tac-modal-card tac-music-add-card"><div class="tac-modal-head"><div><div class="tac-modal-kicker">角色专属音乐</div><div class="tac-modal-title">添加歌曲</div></div><button type="button" class="menu_button tac-icon-button" data-action="close" title="关闭"><i class="fa-solid fa-xmark"></i></button></div>
       <div class="tac-music-add-tabs"><button type="button" class="menu_button is-active" data-tab="local">导入歌曲文件</button><button type="button" class="menu_button" data-tab="online">联网搜索</button></div>
-      <div class="tac-music-add-pane" data-pane="local"><p class="tac-music-help">音频会保存到当前角色卡，可一次选择多个文件，也可以直接输入音频 URL。</p><input id="tac-music-file-input" class="tac-music-file-input" type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.flac" multiple data-action="files"><div class="tac-music-file-actions"><button type="button" class="menu_button tac-music-file-button" data-action="choose-files"><i class="fa-solid fa-folder-open"></i> 选择音频文件</button><button type="button" class="menu_button tac-music-file-button" data-action="url"><i class="fa-solid fa-link"></i> URL 获取</button></div><div class="tac-music-file-name" data-file-name>尚未选择文件</div></div>
+      <div class="tac-music-add-pane" data-pane="local"><p class="tac-music-help">音频会保存到当前角色卡，可一次选择多个文件，也可以直接输入音频 URL 或批量粘贴歌曲数据。</p><input id="tac-music-file-input" class="tac-music-file-input" type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.flac" multiple data-action="files"><div class="tac-music-file-actions"><button type="button" class="menu_button tac-music-file-button" data-action="choose-files"><i class="fa-solid fa-folder-open"></i> 选择音频文件</button><button type="button" class="menu_button tac-music-file-button" data-action="url"><i class="fa-solid fa-link"></i> URL 获取</button><button type="button" class="menu_button tac-music-file-button" data-action="batch"><i class="fa-solid fa-list"></i> 批量导入</button></div><div class="tac-music-file-name" data-file-name>尚未选择文件</div></div>
       <div class="tac-music-add-pane" data-pane="online" hidden><div class="tac-music-search-row"><input type="search" class="text_pole" data-action="query" placeholder="输入歌名或歌手"><button type="button" class="menu_button" data-action="search"><i class="fa-solid fa-magnifying-glass"></i> 搜索</button></div><div class="tac-music-search-results"><div class="tac-binding-empty">输入歌名或歌手，系统会自动搜索可用音源。</div></div></div>
     </div>`;
   overlay.addEventListener('click', async event => {
@@ -4768,6 +4842,7 @@ async function openMusicAddModal() {
     if (event.target.closest('[data-action="close"]')) { close(); return; }
     if (event.target.closest('[data-action="choose-files"]')) { stopPreview(); overlay.querySelector('[data-action="files"]')?.click(); }
     if (event.target.closest('[data-action="url"]')) { stopPreview(); void openMusicUrlImportModal(overlay); }
+    if (event.target.closest('[data-action="batch"]')) { stopPreview(); openMusicBatchImportModal(overlay); }
     if (event.target.closest('[data-action="search"]')) {
       const query = normalizeTag(overlay.querySelector('[data-action="query"]').value);
       if (!query) return;
