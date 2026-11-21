@@ -3843,6 +3843,21 @@ async function getMusicSource(track) {
   return getKnownMusicSource(track);
 }
 
+async function preloadLocalMusicTracks(tracks = state.musicBindings?.tracks || []) {
+  const contextKey = state.musicContextKey;
+  await Promise.all((tracks || []).filter(track => track?.src?.startsWith('tac-local://') && !state.musicObjectUrls.has(track.id)).map(async track => {
+    try {
+      const blob = await readMusicBlob(track.id);
+      if (!blob || state.musicContextKey !== contextKey || !state.musicBindings?.tracks.some(item => item.id === track.id)) return;
+      if (state.musicObjectUrls.has(track.id)) return;
+      const objectUrl = URL.createObjectURL(blob);
+      state.musicObjectUrls.set(track.id, objectUrl);
+    } catch (error) {
+      console.debug('TavernAssetClassifier: failed to preload local music', track.id, error);
+    }
+  }));
+}
+
 async function loadMusicTrack(track, autoplay = false) {
   const audio = ensureMusicAudio();
   if (!track?.src) {
@@ -3899,8 +3914,8 @@ function startMusicTrackFromGesture(track) {
     return false;
   }
   if (!source) {
-    void loadMusicTrack(track, false);
-    notify('info', '正在准备本地音频，请再次点击播放。');
+    void loadMusicTrack(track, true);
+    notify('info', '正在加载本地音频并开始播放。');
     return false;
   }
   state.musicLoadedTrackId = track.id;
@@ -5368,6 +5383,7 @@ function renderMusicModule(bindings) {
     const track = getMusicTrack(music.currentTrackId) || getMusicQueue(music)[0];
     void loadMusicTrack(track, false);
   }
+  void preloadLocalMusicTracks(music.tracks);
   const section = document.createElement('section');
   section.className = 'tac-binding-module tac-music-module';
   section.innerHTML = `<div class="tac-binding-module-head"><div class="tac-binding-module-title"><i class="fa-solid fa-compact-disc"></i> 角色专属音乐</div><div class="tac-music-module-actions"><button type="button" class="menu_button tac-music-add-button" data-action="add" title="添加歌曲"><i class="fa-solid fa-plus"></i><span>添加歌曲</span></button><button type="button" class="menu_button tac-binding-icon" data-action="floating" title="生成或隐藏悬浮播放器"><i class="fa-solid fa-up-right-and-down-left-from-center"></i></button></div></div><div class="tac-music-player-card"><div class="tac-music-current-track">选择歌曲开始播放</div><div class="tac-music-progress-row"><input class="tac-music-progress" type="range" min="0" max="100" step="0.1" value="0"><span class="tac-music-time">0:00 / 0:00</span></div><div class="tac-music-controls"><button type="button" class="menu_button" data-action="prev" title="上一首"><i class="fa-solid fa-backward-step"></i></button><button type="button" class="menu_button tac-music-play-toggle" data-action="play" title="播放"><i class="fa-solid fa-play"></i></button><button type="button" class="menu_button" data-action="next" title="下一首"><i class="fa-solid fa-forward-step"></i></button><button type="button" class="menu_button tac-music-mode" data-mode="sequence" title="顺序播放"><i class="fa-solid fa-list-ol"></i></button><button type="button" class="menu_button tac-binding-icon" data-action="playlist" title="选择播放歌曲"><i class="fa-solid fa-list-check"></i></button></div></div><details class="tac-music-track-details"><summary>全部歌曲（点击展开）</summary><div class="tac-music-track-list"></div></details>`;
