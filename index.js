@@ -61,7 +61,7 @@ const state = {
   musicLoadedTrackId: '',
   musicObjectUrls: new Map(),
   musicResolvedSources: new Map(),
-  musicRepairAttempted: new Set(),
+  musicFailedTrackIds: new Set(),
   musicDbPromise: null,
   musicSavePromise: Promise.resolve(),
 };
@@ -3561,8 +3561,39 @@ function updateMusicPlayerDom() {
   const music = state.musicBindings;
   const track = getMusicTrack();
   getMusicQueryNodes('.tac-music-floating').forEach(node => node.classList.toggle('is-playing', state.musicPlaying));
+  getMusicQueryNodes('.tac-music-floating-toggle').forEach(button => {
+    const cover = normalizeTag(track?.cover);
+    button.classList.toggle('has-cover', Boolean(cover));
+    button.style.backgroundImage = cover ? `url(${JSON.stringify(cover)})` : '';
+    const icon = button.querySelector('i');
+    if (icon) icon.hidden = Boolean(cover);
+  });
   const current = track ? `${track.title}${track.artist ? ` · ${track.artist}` : ''}` : '选择歌曲开始播放';
   getMusicQueryNodes('.tac-music-current-track').forEach(node => { node.textContent = current; });
+  getMusicQueryNodes('.tac-music-floating-queue').forEach(list => {
+    const queue = getMusicQueue(music);
+    const signature = queue.map(item => `${item.id}:${item.title}:${item.artist || ''}`).join('|');
+    if (list.dataset.queueSignature !== signature) {
+      list.replaceChildren();
+      queue.forEach(item => {
+        const button = list.ownerDocument.createElement('button');
+        button.type = 'button';
+        button.className = 'tac-music-floating-queue-item';
+        button.dataset.trackId = item.id;
+        button.innerHTML = '<span></span><small></small>';
+        button.querySelector('span').textContent = item.title;
+        button.querySelector('small').textContent = item.artist || '未知歌手';
+        button.addEventListener('click', event => {
+          event.stopPropagation();
+          void playMusicTrack(item, true);
+        });
+        list.append(button);
+      });
+      if (!queue.length) list.innerHTML = '<small class="tac-music-floating-queue-empty">暂无歌曲</small>';
+      list.dataset.queueSignature = signature;
+    }
+    list.querySelectorAll('[data-track-id]').forEach(button => button.classList.toggle('is-current', button.dataset.trackId === track?.id));
+  });
   getMusicQueryNodes('.tac-music-play-toggle').forEach(button => {
     button.innerHTML = `<i class="fa-solid ${state.musicPlaying ? 'fa-pause' : 'fa-play'}"></i>`;
     button.title = state.musicPlaying ? '暂停' : '播放';
@@ -3723,15 +3754,26 @@ function ensureMusicAudio() {
   audio.addEventListener('play', () => { state.musicPlaying = true; updateMusicPlayerDom(); });
   audio.addEventListener('pause', () => { state.musicPlaying = false; updateMusicPlayerDom(); });
   audio.addEventListener('timeupdate', updateMusicPlayerDom);
-  audio.addEventListener('loadedmetadata', updateMusicPlayerDom);
+  audio.addEventListener('loadedmetadata', () => {
+    const track = getMusicTrack(state.musicLoadedTrackId) || getMusicTrack();
+    if (track) state.musicFailedTrackIds.delete(track.id);
+    updateMusicPlayerDom();
+  });
   audio.addEventListener('error', () => {
     state.musicPlaying = false;
     updateMusicPlayerDom();
-    const track = getMusicTrack();
-    if (track && track.source !== 'local' && !state.musicRepairAttempted.has(track.id)) {
-      state.musicRepairAttempted.add(track.id);
-      void repairOnlineMusicTrack(track);
-    } else notify('warning', '歌曲无法播放，音源地址可能已失效或浏览器拦截了跨域音频。');
+    const track = getMusicTrack(state.musicLoadedTrackId) || getMusicTrack();
+    if (!track) {
+      notify('warning', '歌曲无法播放。');
+      return;
+    }
+    if (state.musicBindings?.currentTrackId !== track.id) return;
+    state.musicFailedTrackIds.add(track.id);
+    const next = getMusicTrackAfterFailure(track);
+    if (next) {
+      notify('warning', `“${track.title}”无法播放，已跳过。`);
+      void playMusicTrack(next, true);
+    } else notify('warning', `“${track.title}”无法播放，播放列表中没有可跳过的歌曲。`);
   });
   audio.addEventListener('volumechange', () => {
     const volume = state.musicBindings?.volume ?? 1;
@@ -3772,32 +3814,6 @@ async function probeMusicSource(src) {
   } catch {
     return false;
   }
-}
-
-async function repairOnlineMusicTrack(track) {
-  const query = [track.title, track.artist].filter(Boolean).join(' ');
-  const results = [];
-  if (track.source === 'netease') {
-    try {
-      const id = new URL(track.src).searchParams.get('id');
-      if (id) results.push({ title: track.title, artist: track.artist, src: getNeteaseMusicProxySource(id), lrc: track.lrc, source: 'netease', providerId: id });
-    } catch { /* continue with a fresh search */ }
-  }
-  results.push(...await fetchMusicSearchResults(query));
-  const candidates = await Promise.all(results.slice(0, 18).map(async result => {
-    if (result.src === track.src || !(await probeMusicSource(result.src))) return null;
-    return result;
-  }));
-  const result = candidates.find(Boolean);
-  if (result) {
-    Object.assign(track, result);
-    await saveMusicState();
-    await loadMusicTrack(track, false);
-    notify('info', `已为“${track.title}”更新可用音源，请再次点击播放。`);
-    return true;
-  }
-  notify('warning', `“${track.title}”的在线音源已失效，请重新搜索后添加。`);
-  return false;
 }
 
 async function getMusicSource(track) {
@@ -3852,7 +3868,21 @@ async function loadMusicTrack(track, autoplay = false) {
     audio.load();
   }
   updateMusicPlayerDom();
-  if (autoplay) void audio.play().catch(() => { state.musicPlaying = false; updateMusicPlayerDom(); });
+  if (autoplay) void audio.play().catch(error => {
+    state.musicPlaying = false;
+    updateMusicPlayerDom();
+    if (error?.name === 'AbortError') return;
+    if (error?.name === 'NotAllowedError') {
+      notify('warning', '浏览器需要在点击播放器后开始播放，请再次点击播放按钮。');
+      return;
+    }
+    state.musicFailedTrackIds.add(track.id);
+    const next = getMusicTrackAfterFailure(track);
+    if (next) {
+      notify('warning', `“${track.title}”无法播放，已跳过。`);
+      void playMusicTrack(next, true);
+    } else notify('warning', `“${track.title}”无法播放。`);
+  });
 }
 
 function startMusicTrackFromGesture(track) {
@@ -3883,8 +3913,16 @@ function startMusicTrackFromGesture(track) {
   result?.catch(error => {
     state.musicPlaying = false;
     updateMusicPlayerDom();
+    if (error?.name === 'AbortError') return;
     if (error?.name === 'NotAllowedError') notify('warning', '浏览器需要在点击播放器后开始播放，请再次点击播放按钮。');
-    else notify('warning', '当前音源无法解码或已失效，正在尝试寻找可播放音源。');
+    else {
+      state.musicFailedTrackIds.add(track.id);
+      const next = getMusicTrackAfterFailure(track);
+      if (next) {
+        notify('warning', `“${track.title}”无法播放，已跳过。`);
+        void playMusicTrack(next, true);
+      } else notify('warning', `“${track.title}”无法播放。`);
+    }
   });
   void saveMusicState();
   updateMusicPlayerDom();
@@ -3909,9 +3947,24 @@ function getMusicNextTrack(direction = 1) {
   return null;
 }
 
+function getMusicTrackAfterFailure(track) {
+  const queue = getMusicQueue();
+  if (queue.length < 2) return null;
+  const available = queue.filter(item => item.id !== track?.id && !state.musicFailedTrackIds.has(item.id));
+  if (!available.length) return null;
+  if (state.musicBindings?.mode === 'random') return available[Math.floor(Math.random() * available.length)];
+  const index = queue.findIndex(item => item.id === track?.id);
+  for (let offset = 1; offset <= queue.length; offset += 1) {
+    const candidate = queue[(Math.max(0, index) + offset) % queue.length];
+    if (candidate && !state.musicFailedTrackIds.has(candidate.id)) return candidate;
+  }
+  return available[0] || null;
+}
+
 async function playMusicTrack(track, autoplay = true) {
   if (!track) return false;
   state.musicBindings.currentTrackId = track.id;
+  state.musicFailedTrackIds.delete(track.id);
   if (autoplay) return startMusicTrackFromGesture(track);
   await loadMusicTrack(track, false);
   await saveMusicState();
@@ -3928,12 +3981,30 @@ async function toggleMusicPlayback() {
     notify('info', '请先添加歌曲并在歌单选择中勾选歌单。');
     return;
   }
+  if (state.musicFailedTrackIds.has(track.id)) {
+    const next = getMusicTrackAfterFailure(track);
+    if (next) return playMusicTrack(next, true);
+    notify('warning', `“${track.title}”无法播放。`);
+    return;
+  }
+  if (!audio.src || state.musicLoadedTrackId !== track.id) {
+    startMusicTrackFromGesture(track);
+    return;
+  }
   if (audio.paused) {
-    if (!audio.src || state.musicLoadedTrackId !== track.id) {
-      startMusicTrackFromGesture(track);
-      return;
-    }
-    audio.play().catch(error => notify('warning', error?.name === 'NotAllowedError' ? '浏览器需要在点击播放器后开始播放，请再次点击播放按钮。' : '当前音源无法解码或已失效，正在尝试寻找可播放音源。'));
+    audio.play().catch(error => {
+      if (error?.name === 'AbortError') return;
+      if (error?.name === 'NotAllowedError') {
+        notify('warning', '浏览器需要在点击播放器后开始播放，请再次点击播放按钮。');
+        return;
+      }
+      state.musicFailedTrackIds.add(track.id);
+      const next = getMusicTrackAfterFailure(track);
+      if (next) {
+        notify('warning', `“${track.title}”无法播放，已跳过。`);
+        void playMusicTrack(next, true);
+      } else notify('warning', `“${track.title}”无法播放。`);
+    });
   } else audio.pause();
   updateMusicPlayerDom();
 }
@@ -4413,7 +4484,7 @@ async function fetchJioSaavnMusicResults(query) {
         providerId: normalizeTag(item.id),
         duration: normalizeMusicDuration(item.duration),
         src: normalizeTag(download?.url).replace(/^http:/i, 'https:'),
-        cover: normalizeTag(item.image?.at?.(-1)?.url),
+        cover: normalizeTag(item.image?.at?.(-1)?.url).replace(/^http:/i, 'https:'),
         source: 'jiosaavn',
       };
     }).filter(item => item.title && item.artist && item.src && item.duration >= 75)
@@ -4660,7 +4731,7 @@ async function fetchMusicSearchResults(query) {
             try { providerId = normalizeTag(new URL(src).searchParams.get('id')); } catch { /* ignore malformed provider URLs */ }
           }
           const duration = normalizeMusicDuration(item.duration || item.duration_ms || item.playTime || item.interval);
-          return title && src ? { title, artist, src, lrc: normalizeTag(item.lrc || item.lyric), cover: normalizeTag(item.pic || item.picUrl), source: server, providerId, duration } : null;
+          return title && src ? { title, artist, src, lrc: normalizeTag(item.lrc || item.lyric), cover: normalizeTag(item.pic || item.picUrl).replace(/^http:/i, 'https:'), source: server, providerId, duration } : null;
         }).filter(Boolean);
       } finally {
         clearTimeout(timer);
@@ -4683,7 +4754,62 @@ async function fetchMusicSearchResults(query) {
     seen.add(key);
     unique.push(item);
   });
-  return filterShortMusicResults(unique);
+  const playable = await filterShortMusicResults(unique);
+  return Promise.all(playable.slice(0, 18).map(enrichMusicSearchResult));
+}
+
+async function fetchMusicMetadataValue(target, timeout = 3200) {
+  const deadline = Date.now() + timeout;
+  for (const endpoint of getMusicSearchProxyTargets(target)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(1800, remaining));
+    try {
+      const response = await fetch(endpoint, { mode: 'cors', signal: controller.signal, headers: { Accept: 'text/plain, application/json, */*' } });
+      if (!response.ok) continue;
+      const text = (await response.text()).trim();
+      if (!text) continue;
+      try {
+        const value = JSON.parse(text);
+        if (typeof value === 'string') return normalizeTag(value);
+        if (value && typeof value === 'object') {
+          const nested = value.data && typeof value.data === 'object' ? value.data : null;
+          return normalizeTag(value.url || value.lrc || value.lyric || value.pic || value.picUrl
+            || nested?.url || nested?.lrc || nested?.lyric || nested?.pic || nested?.picUrl
+            || (typeof value.data === 'string' ? value.data : ''));
+        }
+      } catch { /* Some lyric endpoints return plain LRC text. */ }
+      return text;
+    } catch (error) {
+      console.debug('TavernAssetClassifier: music metadata endpoint unavailable', endpoint, error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return '';
+}
+
+async function enrichMusicSearchResult(result) {
+  if (!result?.providerId) return result;
+  const source = String(result.source || '').toLowerCase();
+  const server = source.startsWith('gdstudio-') ? source.slice('gdstudio-'.length)
+    : source === 'qq' ? 'tencent' : source;
+  if (!['netease', 'tencent', 'kugou', 'kuwo', 'joox', 'jiosaavn'].includes(server)) return result;
+  const requests = [];
+  if (!result.lrc) requests.push(fetchMusicMetadataValue(`https://api.i-meto.com/meting/api?server=${encodeURIComponent(server)}&type=lrc&id=${encodeURIComponent(result.providerId)}`).then(value => ({ key: 'lrc', value })));
+  if (!result.cover) requests.push(fetchMusicMetadataValue(`https://api.i-meto.com/meting/api?server=${encodeURIComponent(server)}&type=pic&id=${encodeURIComponent(result.providerId)}`).then(value => ({ key: 'cover', value })));
+  if (!requests.length) return result;
+  const metadata = await Promise.allSettled(requests);
+  const enriched = { ...result };
+  metadata.forEach(entry => {
+    if (entry.status === 'fulfilled' && entry.value.value) {
+      enriched[entry.value.key] = entry.value.key === 'cover'
+        ? entry.value.value.replace(/^http:/i, 'https:')
+        : entry.value.value;
+    }
+  });
+  return enriched;
 }
 
 function hasMusicPreviewLabel(track) {
@@ -4801,6 +4927,95 @@ async function fetchXingzhigeMusicResults(query) {
   return settled.filter(Boolean);
 }
 
+async function fetchMusicBinary(src, timeout = 20000) {
+  const targets = [src, ...getMusicSearchProxyTargets(src).filter(endpoint => endpoint !== src)];
+  let lastError = null;
+  for (const endpoint of targets) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(endpoint, { mode: 'cors', signal: controller.signal, headers: { Accept: 'audio/*, application/octet-stream, */*' } });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      if (!blob.size) throw new Error('返回的音频为空');
+      if (/text\/html/i.test(blob.type)) throw new Error('返回了网页而不是音频文件');
+      return blob;
+    } catch (error) {
+      lastError = error;
+      console.debug('TavernAssetClassifier: music download endpoint unavailable', endpoint, error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError || new Error('无法获取音频文件');
+}
+
+async function downloadMusicLyrics(lrc) {
+  const value = normalizeTag(lrc);
+  if (!value) return '';
+  if (!/^https?:\/\//i.test(value)) return value;
+  try {
+    return await fetchMusicMetadataValue(value, 10000);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: failed to download lyrics', error);
+    return '';
+  }
+}
+
+async function downloadMusicCover(cover) {
+  const value = normalizeTag(cover);
+  if (!value || value.startsWith('data:')) return value;
+  if (!/^https?:\/\//i.test(value)) return '';
+  try {
+    const blob = await fetchMusicBinary(value, 10000);
+    return await fileToDataUrl(blob);
+  } catch (error) {
+    console.debug('TavernAssetClassifier: failed to download cover', error);
+    return '';
+  }
+}
+
+async function addOnlineMusicResult(result, { download = false } = {}) {
+  const meta = await showMusicTrackEditor(result.title, result.artist);
+  if (!meta) return false;
+  const id = makeBindingId();
+  let src = result.src;
+  let source = result.source;
+  let downloadedLyrics = '';
+  let downloadedCover = '';
+  if (download) {
+    const blob = await fetchMusicBinary(result.src);
+    await saveMusicBlob(id, blob);
+    src = `tac-local://${id}`;
+    source = 'local';
+    [downloadedLyrics, downloadedCover] = await Promise.all([
+      downloadMusicLyrics(result.lrc || result.lyrics),
+      downloadMusicCover(result.cover),
+    ]);
+  }
+  const track = {
+    ...result,
+    ...meta,
+    id,
+    src,
+    source,
+    lyrics: meta.lyricsFileProvided ? meta.lyrics : String(result.lyrics || ''),
+    addedAt: new Date().toISOString(),
+  };
+  if (downloadedLyrics) {
+    track.lyrics = downloadedLyrics;
+    track.lrc = '';
+  }
+  if (downloadedCover) track.cover = downloadedCover;
+  state.musicBindings.tracks.push(track);
+  state.musicBindings.playlists[0].trackIds.push(track.id);
+  if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds.push(track.id);
+  await saveMusicState();
+  renderCharacterBindingPanel();
+  notify('success', download ? `已下载到本地：${track.title}` : `已保存歌曲链接：${track.title}`);
+  return true;
+}
+
 async function openMusicAddModal() {
   const existing = document.querySelector('#tac-music-add-modal');
   existing?.remove();
@@ -4855,9 +5070,17 @@ async function openMusicAddModal() {
       results.slice(0, 12).forEach(result => {
         const row = document.createElement('div');
         row.className = 'tac-music-search-result';
-        row.innerHTML = `<div><b></b><small></small></div><div class="tac-music-search-result-actions"><button type="button" class="menu_button tac-icon-button" data-action="preview" title="试听" aria-label="试听"><i class="fa-solid fa-headphones"></i></button><button type="button" class="menu_button tac-icon-button" data-action="add-result" title="添加歌曲" aria-label="添加歌曲"><i class="fa-solid fa-plus"></i></button></div>`;
+        row.innerHTML = `<div><b></b><small></small><span class="tac-music-search-tags"><span data-tag="lyrics"></span><span data-tag="cover"></span></span></div><div class="tac-music-search-result-actions"><button type="button" class="menu_button tac-icon-button" data-action="preview" title="试听" aria-label="试听"><i class="fa-solid fa-headphones"></i></button><button type="button" class="menu_button tac-icon-button" data-action="save-result" title="保存链接" aria-label="保存链接"><i class="fa-solid fa-link"></i></button><button type="button" class="menu_button tac-icon-button" data-action="download-result" title="下载到本地" aria-label="下载到本地"><i class="fa-solid fa-download"></i></button></div>`;
         row.querySelector('b').textContent = result.title;
         row.querySelector('small').textContent = result.artist || '未知歌手';
+        const lyricsTag = row.querySelector('[data-tag="lyrics"]');
+        const coverTag = row.querySelector('[data-tag="cover"]');
+        const hasLyrics = Boolean(result.lrc || result.lyrics);
+        const hasCover = Boolean(result.cover);
+        lyricsTag.textContent = hasLyrics ? '歌词已同步' : '歌词未找到';
+        coverTag.textContent = hasCover ? '封面已同步' : '封面未找到';
+        lyricsTag.classList.toggle('is-available', hasLyrics);
+        coverTag.classList.toggle('is-available', hasCover);
         row.querySelector('[data-action="preview"]').addEventListener('click', async event => {
           event.stopPropagation();
           const button = event.currentTarget;
@@ -4890,17 +5113,19 @@ async function openMusicAddModal() {
             if (error?.name !== 'AbortError') notify('warning', '浏览器阻止了试听，请再次点击试听按钮。');
           }
         });
-        row.querySelector('[data-action="add-result"]').addEventListener('click', async () => {
+        row.querySelector('[data-action="save-result"]').addEventListener('click', async () => {
           stopPreview();
-          const meta = await showMusicTrackEditor(result.title, result.artist);
-          if (!meta) return;
-          state.musicBindings.tracks.push({ ...result, ...meta, id: makeBindingId(), addedAt: new Date().toISOString() });
-          state.musicBindings.playlists[0].trackIds.push(state.musicBindings.tracks.at(-1).id);
-          if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds.push(state.musicBindings.tracks.at(-1).id);
-          await saveMusicState();
-          renderCharacterBindingPanel();
-          close();
-          notify('success', `已添加歌曲：${meta.title || result.title}`);
+          await runFeatureTask('保存歌曲链接', async () => {
+            const saved = await addOnlineMusicResult(result);
+            if (saved) close();
+          });
+        });
+        row.querySelector('[data-action="download-result"]').addEventListener('click', async () => {
+          stopPreview();
+          await runFeatureTask('下载歌曲', async () => {
+            const saved = await addOnlineMusicResult(result, { download: true });
+            if (saved) close();
+          });
         });
         resultsNode.append(row);
       });
@@ -4996,11 +5221,15 @@ async function deleteMusicTrack(track) {
   state.musicBindings.tracks = state.musicBindings.tracks.filter(item => item.id !== track.id);
   if (Array.isArray(state.musicBindings.queueTrackIds)) state.musicBindings.queueTrackIds = state.musicBindings.queueTrackIds.filter(id => id !== track.id);
   state.musicBindings.playlists.forEach(list => { list.trackIds = list.trackIds.filter(id => id !== track.id); });
-  void deleteMusicBlob(track.id);
+  // Remove the IndexedDB payload as well as the track metadata. Awaiting this
+  // keeps a deleted downloaded song from reappearing if the card is rerendered
+  // immediately after the confirmation.
+  await deleteMusicBlob(track.id);
   const objectUrl = state.musicObjectUrls.get(track.id);
   if (objectUrl) URL.revokeObjectURL(objectUrl);
   state.musicObjectUrls.delete(track.id);
   state.musicResolvedSources.delete(track.id);
+  state.musicFailedTrackIds.delete(track.id);
   if (state.musicBindings.currentTrackId === track.id) {
     state.musicBindings.currentTrackId = '';
     state.musicLoadedTrackId = '';
@@ -5052,7 +5281,7 @@ function renderMusicFloatingPlayer() {
   node.style.top = '180px';
   node.style.right = 'auto';
   node.style.bottom = 'auto';
-  node.innerHTML = `<button type="button" class="tac-music-floating-toggle" title="展开播放器"><i class="fa-solid fa-music"></i></button><div class="tac-music-floating-content"><div class="tac-music-current-track">选择歌曲开始播放</div><div class="tac-music-floating-actions"><button type="button" class="menu_button" data-action="prev" title="上一首"><i class="fa-solid fa-backward-step"></i></button><button type="button" class="menu_button tac-music-play-toggle" data-action="play" title="播放"><i class="fa-solid fa-play"></i></button><button type="button" class="menu_button" data-action="next" title="下一首"><i class="fa-solid fa-forward-step"></i></button><button type="button" class="menu_button tac-music-mode" data-mode="sequence" title="顺序播放"><i class="fa-solid fa-list-ol"></i></button><button type="button" class="menu_button" data-action="lyrics" title="显示当前歌词"><i class="fa-solid fa-align-left"></i></button></div></div><div class="tac-music-floating-lyrics" hidden></div>`;
+  node.innerHTML = `<button type="button" class="tac-music-floating-toggle" title="展开播放器"><i class="fa-solid fa-music"></i></button><div class="tac-music-floating-content"><div class="tac-music-floating-track-head"><div class="tac-music-current-track">选择歌曲开始播放</div><button type="button" class="tac-music-floating-queue-toggle" data-action="queue-toggle" title="显示播放列表" aria-label="显示播放列表"><i class="fa-solid fa-chevron-down"></i></button></div><div class="tac-music-floating-queue" hidden></div><div class="tac-music-floating-actions"><button type="button" class="menu_button" data-action="prev" title="上一首"><i class="fa-solid fa-backward-step"></i></button><button type="button" class="menu_button tac-music-play-toggle" data-action="play" title="播放"><i class="fa-solid fa-play"></i></button><button type="button" class="menu_button" data-action="next" title="下一首"><i class="fa-solid fa-forward-step"></i></button><button type="button" class="menu_button tac-music-mode" data-mode="sequence" title="顺序播放"><i class="fa-solid fa-list-ol"></i></button><button type="button" class="menu_button" data-action="lyrics" title="显示当前歌词"><i class="fa-solid fa-align-left"></i></button><button type="button" class="menu_button" data-action="hide" title="隐藏悬浮窗" aria-label="隐藏悬浮窗"><i class="fa-solid fa-eye-slash"></i></button></div></div><div class="tac-music-floating-lyrics" hidden></div>`;
   node.querySelector('[data-action="play"]').addEventListener('click', () => void toggleMusicPlayback());
   node.querySelector('[data-action="prev"]').addEventListener('click', () => void playNextMusicTrack(-1));
   node.querySelector('[data-action="next"]').addEventListener('click', () => void playNextMusicTrack(1));
@@ -5066,11 +5295,37 @@ function renderMusicFloatingPlayer() {
       updateMusicFloatingLyrics();
     }
   });
+  node.querySelector('[data-action="hide"]').addEventListener('click', event => {
+    event.stopPropagation();
+    toggleMusicFloating();
+  });
+  node.querySelectorAll('.tac-music-floating-content button').forEach(button => {
+    button.addEventListener('pointerdown', event => event.stopPropagation());
+  });
+  node.querySelector('[data-action="queue-toggle"]').addEventListener('click', event => {
+    event.stopPropagation();
+    const button = event.currentTarget;
+    const list = node.querySelector('.tac-music-floating-queue');
+    list.hidden = !list.hidden;
+    button.title = list.hidden ? '显示播放列表' : '收起播放列表';
+    button.setAttribute('aria-label', button.title);
+    button.classList.toggle('is-open', !list.hidden);
+  });
   const toggle = node.querySelector('.tac-music-floating-toggle');
   let suppressToggleClick = false;
   toggle.addEventListener('click', () => {
     if (suppressToggleClick) { suppressToggleClick = false; return; }
     node.classList.toggle('is-expanded');
+    if (!node.classList.contains('is-expanded')) {
+      const queue = node.querySelector('.tac-music-floating-queue');
+      const queueToggle = node.querySelector('[data-action="queue-toggle"]');
+      if (queue) queue.hidden = true;
+      queueToggle?.classList.remove('is-open');
+      if (queueToggle) {
+        queueToggle.title = '显示播放列表';
+        queueToggle.setAttribute('aria-label', queueToggle.title);
+      }
+    }
     if (node.classList.contains('is-expanded') && node.style.left) {
       node.style.left = `${Math.max(4, Math.min(floatingWindow.innerWidth - node.offsetWidth - 4, node.offsetLeft))}px`;
       node.style.top = `${Math.max(4, Math.min(floatingWindow.innerHeight - node.offsetHeight - 4, node.offsetTop))}px`;
@@ -5107,7 +5362,7 @@ function renderMusicModule(bindings) {
     state.musicObjectUrls.clear();
     state.musicResolvedSources.clear();
     state.musicLoadedTrackId = '';
-    state.musicRepairAttempted.clear();
+    state.musicFailedTrackIds.clear();
     state.musicContextKey = contextKey;
     state.musicPlaying = false;
     const track = getMusicTrack(music.currentTrackId) || getMusicQueue(music)[0];
@@ -5339,7 +5594,7 @@ function renderCharacterBindingPanel() {
     state.musicObjectUrls.clear();
     state.musicResolvedSources.clear();
     state.musicLoadedTrackId = '';
-    state.musicRepairAttempted.clear();
+    state.musicFailedTrackIds.clear();
     getMusicHostDocuments().forEach(doc => doc.querySelector('#tac-music-floating')?.remove());
     body.innerHTML = '<div class="tac-binding-empty">打开角色卡后可以保存和加载绑定。</div>';
     return;

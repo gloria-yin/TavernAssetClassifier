@@ -2099,6 +2099,28 @@ html > #tac-music-track-playlist-modal {
   gap: 2px;
 }
 
+.tac-music-search-tags {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tac-music-search-tags > span {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 16%, transparent);
+  border-radius: 4px;
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 48%, transparent);
+  font-size: .68em;
+  line-height: 1.25;
+}
+
+.tac-music-search-tags > span.is-available {
+  border-color: color-mix(in srgb, #38bdf8 55%, transparent);
+  color: color-mix(in srgb, #38bdf8 88%, var(--SmartThemeBodyColor, #eee));
+}
+
 .tac-music-search-result-actions {
   display: inline-flex !important;
   flex: 0 0 auto !important;
@@ -2270,6 +2292,18 @@ html > #tac-music-track-playlist-modal {
   color: var(--SmartThemeBodyColor, #fff);
   box-shadow: 0 4px 14px color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 35%, transparent);
   cursor: pointer;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  overflow: hidden;
+}
+
+.tac-music-floating-toggle.has-cover {
+  border: 2px solid color-mix(in srgb, var(--SmartThemeBodyColor, #fff) 72%, transparent);
+}
+
+.tac-music-floating-toggle.has-cover > i {
+  display: none;
 }
 
 .tac-music-floating.is-playing .tac-music-floating-toggle {
@@ -2290,6 +2324,80 @@ html > #tac-music-track-playlist-modal {
 .tac-music-floating.is-expanded .tac-music-floating-content {
   display: grid;
   gap: 5px;
+}
+
+.tac-music-floating-track-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tac-music-floating-track-head .tac-music-current-track {
+  flex: 1 1 auto;
+}
+
+.tac-music-floating-queue-toggle {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 14%, transparent);
+  color: var(--SmartThemeBodyColor, #fff);
+  cursor: pointer;
+}
+
+.tac-music-floating-queue-toggle.is-open i {
+  transform: rotate(180deg);
+}
+
+.tac-music-floating-queue {
+  display: grid;
+  gap: 3px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 3px;
+  border-radius: 7px;
+  background: color-mix(in srgb, #000 16%, transparent);
+  overscroll-behavior: contain;
+}
+
+.tac-music-floating-queue[hidden] {
+  display: none !important;
+}
+
+.tac-music-floating-queue-item {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tac-music-floating-queue-item:hover,
+.tac-music-floating-queue-item.is-current {
+  border-color: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 55%, transparent);
+  background: color-mix(in srgb, var(--SmartThemeEmColor, #38bdf8) 18%, transparent);
+}
+
+.tac-music-floating-queue-item span,
+.tac-music-floating-queue-item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tac-music-floating-queue-item small,
+.tac-music-floating-queue-empty {
+  color: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 58%, transparent);
+  font-size: .75em;
 }
 
 .tac-music-floating-actions {
