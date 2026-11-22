@@ -64,6 +64,10 @@ const state = {
   musicFailedTrackIds: new Set(),
   musicPlaybackPending: false,
   musicPlaybackRequestId: 0,
+  musicProgressTimer: null,
+  musicProgressLastUpdate: 0,
+  musicVisibilityDocuments: new WeakSet(),
+  musicLyricsCache: new Map(),
   musicDbPromise: null,
   musicSavePromise: Promise.resolve(),
 };
@@ -1313,7 +1317,9 @@ function startThemeBackgroundSync() {
   if (state.themeBackgroundSyncBound) return;
   state.themeBackgroundSyncBound = true;
   if (host.event_types.SETTINGS_UPDATED) host.eventSource?.on?.(host.event_types.SETTINGS_UPDATED, syncBoundBackgroundForCurrentTheme);
-  state.themeBackgroundSyncTimer = setInterval(() => syncBoundBackgroundForCurrentTheme(), 3000);
+  state.themeBackgroundSyncTimer = setInterval(() => {
+    if (!document.hidden) syncBoundBackgroundForCurrentTheme();
+  }, 3000);
 }
 
 function stopThemeBackgroundSync() {
@@ -3541,12 +3547,84 @@ function parseMusicLyrics(value) {
 }
 
 function getCurrentMusicLyric(track, currentTime = 0) {
-  const entries = parseMusicLyrics(track?.lyrics);
+  if (!track) return '';
+  const source = String(track.lyrics || '');
+  if (!source) return '';
+  const cached = state.musicLyricsCache.get(track.id);
+  const entries = cached?.source === source
+    ? cached.entries
+    : (() => {
+      const parsed = parseMusicLyrics(source);
+      state.musicLyricsCache.set(track.id, { source, entries: parsed });
+      return parsed;
+    })();
   if (!entries.length) return '';
   if (currentTime < entries[0].time) return '';
-  let current = entries[0];
-  entries.forEach(entry => { if (entry.time <= currentTime) current = entry; });
-  return current.text;
+  let low = 0;
+  let high = entries.length - 1;
+  let currentIndex = 0;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (entries[middle].time <= currentTime) {
+      currentIndex = middle;
+      low = middle + 1;
+    } else high = middle - 1;
+  }
+  return entries[currentIndex].text;
+}
+
+function isMusicDocumentVisible(doc) {
+  try {
+    return !doc.hidden && doc.visibilityState !== 'hidden';
+  } catch {
+    return true;
+  }
+}
+
+function isMusicUiVisible() {
+  return getMusicHostDocuments().some(isMusicDocumentVisible);
+}
+
+function bindMusicVisibilityHandlers() {
+  getMusicHostDocuments().forEach(doc => {
+    if (state.musicVisibilityDocuments.has(doc)) return;
+    state.musicVisibilityDocuments.add(doc);
+    doc.addEventListener('visibilitychange', () => {
+      if (isMusicDocumentVisible(doc)) {
+        state.musicProgressLastUpdate = 0;
+        updateMusicPlayerDom();
+      }
+    }, { passive: true });
+  });
+}
+
+function updateMusicProgressDom() {
+  if (!isMusicUiVisible()) return;
+  const audio = state.musicAudio;
+  const duration = Number.isFinite(audio?.duration) && audio.duration > 0 ? audio.duration : 0;
+  const currentTime = Number.isFinite(audio?.currentTime) ? Math.max(0, audio.currentTime) : 0;
+  const progress = duration ? String((currentTime / duration) * 100 || 0) : '0';
+  getMusicQueryNodes('.tac-music-progress').forEach(input => {
+    if (input.value !== progress) input.value = progress;
+  });
+  const format = value => Number.isFinite(value) ? `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}` : '0:00';
+  const time = `${format(currentTime)} / ${format(audio?.duration || 0)}`;
+  getMusicQueryNodes('.tac-music-time').forEach(node => {
+    if (node.textContent !== time) node.textContent = time;
+  });
+  updateMusicFloatingLyrics();
+}
+
+function scheduleMusicProgressUpdate() {
+  if (!isMusicUiVisible() || state.musicProgressTimer) return;
+  const elapsed = Date.now() - state.musicProgressLastUpdate;
+  const delay = Math.max(0, 300 - elapsed);
+  state.musicProgressTimer = setTimeout(() => {
+    state.musicProgressTimer = null;
+    if (!isMusicUiVisible()) return;
+    state.musicProgressLastUpdate = Date.now();
+    updateMusicProgressDom();
+  }, delay);
 }
 
 function updateMusicFloatingLyrics() {
@@ -3560,6 +3638,12 @@ function updateMusicFloatingLyrics() {
 }
 
 function updateMusicPlayerDom() {
+  if (!isMusicUiVisible()) return;
+  bindMusicVisibilityHandlers();
+  if (state.musicProgressTimer) {
+    clearTimeout(state.musicProgressTimer);
+    state.musicProgressTimer = null;
+  }
   const music = state.musicBindings;
   const track = getMusicTrack();
   getMusicQueryNodes('.tac-music-floating').forEach(node => node.classList.toggle('is-playing', state.musicPlaying));
@@ -3606,15 +3690,6 @@ function updateMusicPlayerDom() {
     button.setAttribute('aria-label', button.title);
     button.setAttribute('aria-pressed', String(state.musicPlaying || pending));
   });
-  getMusicQueryNodes('.tac-music-progress').forEach(input => {
-    if (!state.musicAudio || !Number.isFinite(state.musicAudio.duration)) return;
-    input.value = String((state.musicAudio.currentTime / state.musicAudio.duration) * 100 || 0);
-  });
-  getMusicQueryNodes('.tac-music-time').forEach(node => {
-    const audio = state.musicAudio;
-    const format = value => Number.isFinite(value) ? `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}` : '0:00';
-    node.textContent = `${format(audio?.currentTime || 0)} / ${format(audio?.duration || 0)}`;
-  });
   getMusicQueryNodes('.tac-music-mode').forEach(button => {
     const mode = music?.mode || 'sequence';
     button.dataset.mode = mode;
@@ -3625,7 +3700,8 @@ function updateMusicPlayerDom() {
     const icon = button.querySelector('i');
     if (icon) icon.className = `fa-solid ${mode === 'sequence' ? 'fa-list-ol' : mode === 'single' ? 'fa-repeat' : 'fa-shuffle'}`;
   });
-  updateMusicFloatingLyrics();
+  state.musicProgressLastUpdate = Date.now();
+  updateMusicProgressDom();
 }
 
 function getMusicStorageKey(trackId) {
@@ -3750,6 +3826,7 @@ function saveMusicState() {
 }
 
 function ensureMusicAudio() {
+  bindMusicVisibilityHandlers();
   if (state.musicAudio) return state.musicAudio;
   const audio = document.createElement('audio');
   audio.id = 'tac-character-music-audio';
@@ -3768,7 +3845,7 @@ function ensureMusicAudio() {
     state.musicPlaying = false;
     updateMusicPlayerDom();
   });
-  audio.addEventListener('timeupdate', updateMusicPlayerDom);
+  audio.addEventListener('timeupdate', scheduleMusicProgressUpdate);
   audio.addEventListener('loadedmetadata', () => {
     const track = getMusicTrack(state.musicLoadedTrackId) || getMusicTrack();
     if (track) state.musicFailedTrackIds.delete(track.id);
@@ -5291,6 +5368,7 @@ async function deleteMusicTrack(track) {
   state.musicObjectUrls.delete(track.id);
   state.musicResolvedSources.delete(track.id);
   state.musicFailedTrackIds.delete(track.id);
+  state.musicLyricsCache.delete(track.id);
   if (state.musicBindings.currentTrackId === track.id) {
     state.musicPlaybackRequestId += 1;
     state.musicPlaybackPending = false;
@@ -5426,6 +5504,7 @@ function renderMusicModule(bindings) {
     state.musicResolvedSources.clear();
     state.musicLoadedTrackId = '';
     state.musicFailedTrackIds.clear();
+    state.musicLyricsCache.clear();
     state.musicPlaybackRequestId += 1;
     state.musicPlaybackPending = false;
     state.musicContextKey = contextKey;
@@ -5661,6 +5740,7 @@ function renderCharacterBindingPanel() {
     state.musicResolvedSources.clear();
     state.musicLoadedTrackId = '';
     state.musicFailedTrackIds.clear();
+    state.musicLyricsCache.clear();
     state.musicPlaybackRequestId += 1;
     state.musicPlaybackPending = false;
     getMusicHostDocuments().forEach(doc => doc.querySelector('#tac-music-floating')?.remove());
@@ -5972,7 +6052,9 @@ async function start() {
     bindHostEvent('CHAT_COMPLETION_SETTINGS_READY', retryPendingCharacterBindings);
     bindHostEvent('OAI_PRESET_CHANGED_AFTER', retryPendingCharacterBindings);
     refreshFeatureMounts();
-    state.featureMountTimer = setInterval(refreshFeatureMounts, 1000);
+    state.featureMountTimer = setInterval(() => {
+      if (!document.hidden) refreshFeatureMounts();
+    }, 1000);
     scheduleCharacterBindingApply();
   })().catch(error => {
     state.started = false;
@@ -5985,6 +6067,8 @@ async function start() {
 window.addEventListener('pagehide', event => {
   if (event.persisted) return;
   clearInterval(state.featureMountTimer);
+  clearTimeout(state.musicProgressTimer);
+  state.musicProgressTimer = null;
   clearTimeout(state.characterBindingTimer);
   clearTimeout(state.characterBindingRenderTimer);
   stopThemeBackgroundSync();
