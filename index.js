@@ -443,6 +443,11 @@ function normalizeCharacterBindings(bindings = {}) {
   const users = root.users && typeof root.users === 'object' ? root.users : {};
   const worldBooks = root.worldBooks && typeof root.worldBooks === 'object' ? root.worldBooks : {};
   const beautify = root.beautify && typeof root.beautify === 'object' ? root.beautify : {};
+  // Versioned character records are persisted bindings.  Treat them as live
+  // references even when they were written before the referenceOnly marker
+  // existed; unversioned objects are kept as legacy snapshots for API callers
+  // and old in-memory data.
+  const liveBindings = Number(root.version) >= 5;
   const music = normalizeMusicBindings(root.music);
   const legacyThemeName = normalizeTag(beautify.themeName);
   const beautifyItems = (Array.isArray(beautify.items) ? beautify.items : [])
@@ -459,7 +464,7 @@ function normalizeCharacterBindings(bindings = {}) {
   const uniqueBeautifyItems = Array.from(new Map(beautifyItems.map(item => [normalizeThemeNameKey(item.themeName), item])).values());
   const requestedBeautifyStar = normalizeTag(beautify.starredId) || (legacyThemeName ? 'legacy-beautify' : '');
   return {
-    version: 5,
+    version: 6,
     presets: {
       starredId: normalizeTag(presets.starredId),
       items: Array.isArray(presets.items) ? presets.items.filter(Boolean).map(item => ({
@@ -468,7 +473,8 @@ function normalizeCharacterBindings(bindings = {}) {
         createdAt: normalizeTag(item.createdAt),
         presetName: normalizeTag(item.presetName),
         presetValue: normalizeTag(item.presetValue),
-        promptOrder: Array.isArray(item.promptOrder) ? cloneData(item.promptOrder) : [],
+        referenceOnly: item.referenceOnly === true || liveBindings,
+        ...(item.referenceOnly === true || liveBindings ? {} : { promptOrder: Array.isArray(item.promptOrder) ? cloneData(item.promptOrder) : [] }),
         updatedAt: normalizeTag(item.updatedAt),
       })) : [],
     },
@@ -490,15 +496,17 @@ function normalizeCharacterBindings(bindings = {}) {
         name: normalizeTag(item.name) || '未命名 user 绑定',
         createdAt: normalizeTag(item.createdAt),
         avatar: normalizeTag(item.avatar),
-        userName: normalizeTag(item.userName),
+        ...(liveBindings && normalizeTag(item.avatar) ? {} : { userName: normalizeTag(item.userName) }),
+        referenceOnly: item.referenceOnly === true || liveBindings,
       })) : [],
     },
     worldBooks: {
       starredId: normalizeTag(worldBooks.starredId),
       items: Array.isArray(worldBooks.items) ? worldBooks.items.filter(Boolean).map(item => {
+        const referenceOnly = item.referenceOnly === true || liveBindings;
         const books = Array.isArray(item.books) ? item.books.filter(book => book && normalizeTag(book.name)).map(book => ({
           name: normalizeTag(book.name),
-          data: book.data && typeof book.data === 'object' ? cloneData(book.data) : { entries: {} },
+          ...(referenceOnly ? {} : { data: book.data && typeof book.data === 'object' ? cloneData(book.data) : { entries: {} } }),
         })) : [];
         const hasScopedSelection = Array.isArray(item.globalBooks) || item.characterBooks;
         return {
@@ -512,6 +520,7 @@ function normalizeCharacterBindings(bindings = {}) {
             additional: uniqueTags(item.characterBooks?.additional),
           },
           preserveCharacterBooks: Boolean(item.preserveCharacterBooks),
+          referenceOnly,
           books,
         };
       }) : [],
@@ -532,6 +541,20 @@ async function saveCurrentCharacterBindings(bindings) {
     return false;
   }
   const normalized = normalizeCharacterBindings(bindings);
+  // Anything written from this point forward is a live binding.  This also
+  // upgrades old snapshots when the user next saves the character card.
+  normalized.presets.items.forEach(item => {
+    item.referenceOnly = true;
+    delete item.promptOrder;
+  });
+  normalized.users.items.forEach(item => {
+    item.referenceOnly = true;
+    if (item.avatar) delete item.userName;
+  });
+  normalized.worldBooks.items.forEach(item => {
+    item.referenceOnly = true;
+    item.books = item.books.map(book => ({ name: book.name }));
+  });
   try {
     await writeVerifiedExtensionField(id, EXTENSION_KEY, normalized);
     scheduleCharacterBindingRender();
@@ -641,19 +664,20 @@ function getTransferableWorldBookBinding(item) {
     ...(item?.characterBooks?.additional ?? []),
   ]));
   const globalBookNames = new Set(uniqueTags(item?.globalBooks).filter(name => !characterBookNames.has(name)));
-  const books = (Array.isArray(item?.books) ? item.books : [])
-    .filter(book => globalBookNames.has(normalizeTag(book?.name)))
-    .map(book => ({
-      name: normalizeTag(book.name),
-      data: { entries: cloneData(book?.data?.entries ?? {}) },
-    }))
-    .filter(book => Object.keys(book.data.entries).length);
+  const knownBookNames = uniqueTags([
+    ...(Array.isArray(item?.books) ? item.books.map(book => book?.name) : []),
+    ...globalBookNames,
+  ]);
+  const books = knownBookNames
+    .filter(name => globalBookNames.has(name))
+    .map(name => ({ name }));
   if (!books.length) return null;
   return {
     ...cloneData(item),
     globalBooks: books.map(book => book.name),
     characterBooks: { primary: '', additional: [] },
     preserveCharacterBooks: true,
+    referenceOnly: true,
     books,
   };
 }
@@ -664,10 +688,7 @@ function getCharacterTransferCounts(bindings) {
     presets: bindings.presets.items.length,
     worldBooks: bindings.worldBooks.items.reduce((total, item) => {
       const transferable = getTransferableWorldBookBinding(item);
-      return total + (transferable?.books ?? []).reduce(
-        (count, book) => count + Object.keys(book.data.entries).length,
-        0,
-      );
+      return total + (transferable?.books ?? []).length;
     }, 0),
     users: bindings.users.items.length,
   };
@@ -675,9 +696,9 @@ function getCharacterTransferCounts(bindings) {
 
 function getTransferredBindingSignature(type, item) {
   if (type === 'beautify') return normalizeThemeNameKey(item.themeName);
-  if (type === 'presets') return JSON.stringify([item.presetName, item.presetValue, item.promptOrder]);
-  if (type === 'users') return JSON.stringify([item.avatar, item.userName]);
-  return JSON.stringify([item.globalBooks, item.books]);
+  if (type === 'presets') return JSON.stringify([item.presetValue || item.presetName]);
+  if (type === 'users') return JSON.stringify([item.avatar || item.userName]);
+  return JSON.stringify([item.globalBooks, item.characterBooks, item.books?.map(book => book?.name)]);
 }
 
 function mergeTransferredBindingBucket(type, sourceBucket, targetBucket, transform = item => cloneData(item)) {
@@ -2293,8 +2314,14 @@ function getCurrentPromptPresetValue() {
 }
 
 function getPresetBindingDisplayName(binding) {
-  if (normalizeTag(binding?.presetName)) return normalizeTag(binding.presetName);
   const select = getCurrentPromptPresetSelect();
+  const referenceOnly = binding?.referenceOnly === true
+    || !Object.prototype.hasOwnProperty.call(binding || {}, 'promptOrder');
+  if (normalizeTag(binding?.presetName)) {
+    const name = normalizeTag(binding.presetName);
+    const option = Array.from(select?.options ?? []).find(item => normalizeTag(item.textContent) === name);
+    if (option || !referenceOnly) return name;
+  }
   if (binding?.presetValue && select) {
     const option = Array.from(select.options).find(item => item.value === binding.presetValue);
     if (option) return normalizeTag(option.textContent || option.value);
@@ -2311,17 +2338,18 @@ function getCurrentPromptOrderSnapshot() {
   return cloneData(manager.getPromptOrderForCharacter(character));
 }
 
-function capturePresetBinding(name) {
+function capturePresetBinding(name, { includePromptOrder = true } = {}) {
   const select = getCurrentPromptPresetSelect();
   const selected = select?.selectedOptions?.[0];
-  return {
+  const binding = {
     id: makeBindingId(),
     name,
     createdAt: new Date().toISOString(),
     presetName: normalizeTag(selected?.textContent || select?.value),
     presetValue: normalizeTag(select?.value),
-    promptOrder: getCurrentPromptOrderSnapshot(),
   };
+  if (includePromptOrder) binding.promptOrder = getCurrentPromptOrderSnapshot();
+  return binding;
 }
 
 function captureUserBinding(name) {
@@ -2332,6 +2360,24 @@ function captureUserBinding(name) {
     avatar: normalizeTag(host.user_avatar),
     userName: normalizeTag(host.name1),
   };
+}
+
+function getUserBindingDisplayName(binding) {
+  const avatar = normalizeTag(binding?.avatar);
+  const referenceOnly = binding?.referenceOnly === true
+    || !Object.prototype.hasOwnProperty.call(binding || {}, 'userName');
+  if (avatar) {
+    try {
+      const personas = host.power_user?.personas;
+      const persona = personas && typeof personas === 'object' ? personas[avatar] : null;
+      const current = typeof persona === 'string'
+        ? normalizeTag(persona)
+        : normalizeTag(persona?.name || persona?.userName || persona?.displayName);
+      if (current) return current;
+    } catch { /* Fall back to the name stored by older bindings. */ }
+    if (referenceOnly && avatar === normalizeTag(host.user_avatar)) return normalizeTag(host.name1);
+  }
+  return normalizeTag(binding?.userName) || '未记录角色名';
 }
 
 function getCurrentCharacterWorldBookSelection() {
@@ -2347,17 +2393,16 @@ function getCurrentCharacterWorldBookSelection() {
 
 function getWorldBookBindingSummary(binding) {
   const books = Array.isArray(binding?.books) ? binding.books : [];
-  const entryCount = books.reduce((total, book) => total + Object.keys(book?.data?.entries ?? {}).length, 0);
   const globalCount = uniqueTags(binding?.globalBooks).length;
   const characterCount = uniqueTags([
     binding?.characterBooks?.primary,
     ...(binding?.characterBooks?.additional ?? []),
   ]).length;
   const characterSummary = binding?.preserveCharacterBooks ? '角色 保留' : `角色 ${characterCount} 本`;
-  return `全局 ${globalCount} 本 · ${characterSummary} · ${entryCount} 条目`;
+  return `全局 ${globalCount} 本 · ${characterSummary} · ${books.length} 本实时读取`;
 }
 
-async function captureWorldBookBinding(name) {
+async function captureWorldBookBinding(name, { includeData = true } = {}) {
   const characterKey = getCurrentCharacterKey();
   const globalBooks = uniqueTags(host.selected_world_info);
   const characterSelection = getCurrentCharacterWorldBookSelection();
@@ -2366,12 +2411,14 @@ async function captureWorldBookBinding(name) {
     additional: characterSelection.additional,
   };
   const bookNames = uniqueTags([globalBooks, characterBooks.primary, characterBooks.additional].flat());
-  const books = [];
-  for (const bookName of bookNames) {
-    const data = await loadWorldInfo(bookName);
-    assertCharacterContext(characterKey);
-    if (!data) throw new Error(`failed to load world book: ${bookName}`);
-    books.push({ name: bookName, data: cloneData(data) });
+  const books = bookNames.map(bookName => ({ name: bookName }));
+  if (includeData) {
+    for (const book of books) {
+      const data = await loadWorldInfo(book.name);
+      assertCharacterContext(characterKey);
+      if (!data) throw new Error(`failed to load world book: ${book.name}`);
+      book.data = cloneData(data);
+    }
   }
   return {
     id: makeBindingId(),
@@ -2447,13 +2494,23 @@ async function savePresetBinding() {
     notify('info', '当前没有可保存的预设。');
     return;
   }
-  // Freeze the selection and order before automatic bindings can change them during the dialog.
-  const snapshot = capturePresetBinding(presetName);
+  // Freeze the selected entry before automatic bindings can change it during
+  // the dialog.  Any legacy prompt-order field is removed before persistence.
+  let snapshot;
+  try {
+    snapshot = capturePresetBinding(presetName);
+  } catch (error) {
+    // A preset reference does not need the optional prompt-order manager.
+    // Keep the older capture API strict while allowing saving to work when
+    // that manager has not loaded yet.
+    if (!/预设条目管理器尚未就绪/.test(String(error?.message || error))) throw error;
+    snapshot = capturePresetBinding(presetName, { includePromptOrder: false });
+  }
   const name = await requestBindingName('预设绑定名称', snapshot.presetName);
   if (!name) return;
   assertCharacterContext(characterKey);
   const bindings = getCurrentCharacterBindings();
-  bindings.presets.items.unshift({ ...snapshot, name });
+  bindings.presets.items.unshift({ ...snapshot, name, referenceOnly: true });
   if (await saveCurrentCharacterBindings(bindings)) notify('success', '预设绑定已保存到当前角色卡。');
 }
 
@@ -2463,7 +2520,7 @@ async function saveUserBinding() {
   if (!name) return;
   assertCharacterContext(characterKey);
   const bindings = getCurrentCharacterBindings();
-  bindings.users.items.unshift(captureUserBinding(name));
+  bindings.users.items.unshift({ ...captureUserBinding(name), referenceOnly: true });
   if (await saveCurrentCharacterBindings(bindings)) notify('success', 'user 绑定已保存到当前角色卡。');
 }
 
@@ -2480,16 +2537,20 @@ async function saveWorldBookBinding() {
   if (!name) return;
   assertCharacterContext(characterKey);
   try {
-    const snapshot = await captureWorldBookBinding(name);
+    const snapshot = await captureWorldBookBinding(name, { includeData: false });
     assertCharacterContext(characterKey);
     const bindings = getCurrentCharacterBindings();
-    bindings.worldBooks.items.unshift(snapshot);
+    bindings.worldBooks.items.unshift({
+      ...snapshot,
+      referenceOnly: true,
+      books: snapshot.books.map(book => ({ name: book.name })),
+    });
     if (await saveCurrentCharacterBindings(bindings)) {
       notify('success', `世界书绑定已保存：${getWorldBookBindingSummary(snapshot)}`);
     }
   } catch (error) {
     console.error('TavernAssetClassifier: failed to capture world books', error);
-    notify('error', '读取世界书条目失败，未保存绑定。');
+    notify('error', '读取当前世界书引用失败，未保存绑定。');
   }
 }
 
@@ -2593,7 +2654,7 @@ function openCharacterTransferModal(sourceAvatar, targetAvatar, fallbackName = '
   const options = [
     { type: 'beautify', icon: 'fa-palette', label: '美化', detail: '复制已添加的美化', unit: '项' },
     { type: 'presets', icon: 'fa-sliders', label: '预设', detail: '复制预设与条目顺序', unit: '项' },
-    { type: 'worldBooks', icon: 'fa-book-atlas', label: '世界书', detail: '仅复制非角色绑定世界书的条目', unit: '条' },
+    { type: 'worldBooks', icon: 'fa-book-atlas', label: '世界书', detail: '仅复制非角色绑定世界书的引用', unit: '本' },
     { type: 'users', icon: 'fa-user', label: 'user 信息', detail: '复制 user 名称与头像绑定', unit: '项' },
   ];
 
@@ -2751,16 +2812,29 @@ async function applyPresetBinding(binding, { automatic = false } = {}) {
   const characterKey = getCurrentCharacterKey();
   const select = getCurrentPromptPresetSelect();
   const options = Array.from(select?.options ?? []);
+  const referenceOnly = binding.referenceOnly === true || !Object.prototype.hasOwnProperty.call(binding, 'promptOrder');
   const presetName = normalizeTag(binding.presetName);
-  // Numeric option values can change when the host rebuilds its preset list.
-  const matchedOption = presetName
+  // Match the stable visible preset name first.  SillyTavern can rebuild
+  // numeric option values when its list changes; the value is only a fallback
+  // for records whose name is unavailable (or for a renamed option).
+  const valueMatch = binding.presetValue
+    ? options.find(option => option.value === binding.presetValue)
+    : null;
+  const nameMatch = presetName
     ? options.find(option => normalizeTag(option.textContent) === presetName)
-    : options.find(option => binding.presetValue && option.value === binding.presetValue);
+    : null;
+  const matchedOption = referenceOnly
+    ? (nameMatch || valueMatch)
+    : (presetName ? nameMatch : valueMatch);
   if (!matchedOption && (binding.presetName || binding.presetValue)) throw new Error(`找不到预设：${getPresetBindingDisplayName(binding)}`);
-  const hasPromptOrder = Array.isArray(binding.promptOrder) && binding.promptOrder.length > 0;
+  // Reference bindings follow the currently loaded preset.  Keep applying a
+  // prompt-order snapshot only for legacy in-memory records that predate the
+  // referenceOnly marker.
+  const hasPromptOrder = !referenceOnly && Array.isArray(binding.promptOrder) && binding.promptOrder.length > 0;
   if (hasPromptOrder) requirePromptOrderManager();
   const presetNeedsChange = Boolean(matchedOption && select?.value !== matchedOption.value);
-  if (presetNeedsChange) {
+  const presetNeedsRefresh = Boolean(referenceOnly && matchedOption && !presetNeedsChange);
+  if (presetNeedsChange || presetNeedsRefresh) {
     await changePromptPreset(select, matchedOption);
   }
   assertCharacterContext(characterKey);
@@ -2790,21 +2864,29 @@ async function applyPresetBinding(binding, { automatic = false } = {}) {
 async function applyUserBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
   const characterKey = getCurrentCharacterKey();
+  const referenceOnly = binding.referenceOnly === true
+    || !Object.prototype.hasOwnProperty.call(binding, 'userName');
   const avatarNeedsChange = Boolean(binding.avatar && binding.avatar !== normalizeTag(host.user_avatar));
-  const nameNeedsChange = Boolean(binding.userName && binding.userName !== normalizeTag(host.name1));
+  const persona = referenceOnly && binding.avatar ? host.power_user.personas?.[binding.avatar] : null;
+  const personaName = referenceOnly && binding.avatar
+    ? (typeof persona === 'string'
+      ? normalizeTag(persona)
+      : normalizeTag(persona?.name || persona?.userName || persona?.displayName) || normalizeTag(binding.userName))
+    : normalizeTag(binding.userName);
+  const nameNeedsChange = Boolean(personaName && personaName !== normalizeTag(host.name1));
   if (avatarNeedsChange && !host.power_user.personas?.[binding.avatar]) throw new Error(`找不到 user 头像：${binding.avatar}`);
-  host.require([...(avatarNeedsChange ? ['setUserAvatar'] : []), ...(binding.userName ? ['setUserName'] : [])]);
+  host.require([...(avatarNeedsChange ? ['setUserAvatar'] : []), ...(personaName ? ['setUserName'] : [])]);
   if (avatarNeedsChange) {
     await setUserAvatar(binding.avatar, { toastPersonaNameChange: !automatic, navigateToCurrent: false });
   }
   assertCharacterContext(characterKey);
-  if (binding.userName && normalizeTag(host.name1) !== binding.userName) {
-    await setUserName(binding.userName, { toastPersonaNameChange: !automatic });
+  if (personaName && normalizeTag(host.name1) !== personaName) {
+    await setUserName(personaName, { toastPersonaNameChange: !automatic });
   }
   assertCharacterContext(characterKey);
   if ((avatarNeedsChange && normalizeTag(host.user_avatar) !== binding.avatar)
-    || (binding.userName && normalizeTag(host.name1) !== binding.userName)) throw new Error('未确认 user 名称或头像已切换，请重新读取后重试。');
-  const changed = (avatarNeedsChange && Boolean(host.power_user.personas?.[binding.avatar])) || nameNeedsChange;
+    || (personaName && normalizeTag(host.name1) !== personaName)) throw new Error('未确认 user 名称或头像已切换，请重新读取后重试。');
+  const changed = avatarNeedsChange || nameNeedsChange;
   if (!automatic) notify('success', changed ? `已应用 user 绑定：${binding.name}` : '当前 user 已与绑定一致。');
   return changed;
 }
@@ -2828,36 +2910,60 @@ async function applyWorldBookBinding(binding, { automatic = false } = {}) {
   if (!binding) return false;
   const characterKey = getCurrentCharacterKey();
   const books = Array.isArray(binding.books) ? binding.books : [];
+  const referenceOnly = binding.referenceOnly === true || books.every(book => !book?.data);
   const targetGlobalBooks = uniqueTags(binding.globalBooks ?? books.map(book => book.name));
-  let contentChanged = false;
+  const referencedBookNames = uniqueTags([
+    ...targetGlobalBooks,
+    ...(binding.preserveCharacterBooks ? [] : [
+      binding.characterBooks?.primary,
+      ...(binding.characterBooks?.additional ?? []),
+    ]),
+    ...books
+      .filter(book => !binding.preserveCharacterBooks || targetGlobalBooks.includes(normalizeTag(book?.name)))
+      .map(book => book?.name),
+  ]);
 
   try {
-    host.require(['loadWorldInfo', 'saveWorldInfo', 'getWorldInfoSettings', 'updateWorldInfoSettings', 'updateWorldInfoList', 'writeExtensionField', 'charSetAuxWorlds']);
+    host.require([
+      'loadWorldInfo',
+      ...(referenceOnly ? [] : ['saveWorldInfo']),
+      'getWorldInfoSettings', 'updateWorldInfoSettings', 'updateWorldInfoList', 'writeExtensionField', 'charSetAuxWorlds',
+    ]);
     getCurrentCharacterWorldBookSelection();
     const beforeGlobalBooks = [...host.selected_world_info];
-    if (books.some(book => !book?.name || !book.data?.entries || typeof book.data.entries !== 'object')) throw new Error('世界书绑定数据不完整，未应用。');
-    for (const book of books) {
-      const current = await loadWorldInfo(book.name);
-      assertCharacterContext(characterKey);
-      if (dataMatches(current, book.data)) {
-        // Native saves update the memory cache even when the disk write fails.
-        const persisted = await readSavedWorldBook(book.name, { allowMissing: true });
+    let contentChanged = false;
+    if (!referenceOnly) {
+      if (books.some(book => !book?.name || !book.data?.entries || typeof book.data.entries !== 'object')) throw new Error('世界书绑定数据不完整，未应用。');
+      for (const book of books) {
+        const current = await loadWorldInfo(book.name);
         assertCharacterContext(characterKey);
-        if (dataMatches(persisted, book.data)) continue;
+        if (dataMatches(current, book.data)) {
+          const persisted = await readSavedWorldBook(book.name, { allowMissing: true });
+          assertCharacterContext(characterKey);
+          if (dataMatches(persisted, book.data)) continue;
+        }
+        await saveWorldInfo(book.name, cloneData(book.data), true);
+        assertCharacterContext(characterKey);
+        const persisted = await readSavedWorldBook(book.name);
+        assertCharacterContext(characterKey);
+        if (!dataMatches(persisted, book.data)) throw new Error(`未确认世界书已完整保存：${book.name}`);
+        contentChanged = true;
       }
-      await saveWorldInfo(book.name, cloneData(book.data), true);
-      assertCharacterContext(characterKey);
-      const persisted = await readSavedWorldBook(book.name);
-      assertCharacterContext(characterKey);
-      if (!dataMatches(persisted, book.data)) throw new Error(`未确认世界书已完整保存：${book.name}`);
-      contentChanged = true;
+    } else {
+      // Validate that the referenced books still exist, but never write their
+      // content.  Their current entries are the source of truth after edits.
+      for (const bookName of referencedBookNames) {
+        const current = await loadWorldInfo(bookName);
+        assertCharacterContext(characterKey);
+        if (!current) throw new Error(`找不到世界书：${bookName}`);
+      }
     }
 
     const globalSelectionChanged = !stringSetsMatch(beforeGlobalBooks, targetGlobalBooks);
-    if (globalSelectionChanged) {
+    if (contentChanged || globalSelectionChanged) {
       updateWorldInfoSettings(cloneData(getWorldInfoSettings()), targetGlobalBooks);
     }
-    if (contentChanged || globalSelectionChanged) {
+    if (globalSelectionChanged) {
       await updateWorldInfoList();
     }
     assertCharacterContext(characterKey);
@@ -3001,17 +3107,25 @@ async function updatePresetBinding(id) {
   }
   const original = getCurrentCharacterBindings().presets.items.find(binding => binding.id === id);
   if (!original) return;
-  const snapshot = capturePresetBinding(original.name);
+  let snapshot;
+  try {
+    snapshot = capturePresetBinding(original.name);
+  } catch (error) {
+    if (!/预设条目管理器尚未就绪/.test(String(error?.message || error))) throw error;
+    snapshot = capturePresetBinding(original.name, { includePromptOrder: false });
+  }
   if (!await requestUpdateBindingConfirmation('更新预设绑定', `将“${original.name}”更新为当前预设“${snapshot.presetName}”，是否继续？`)) return;
   assertCharacterContext(characterKey);
 
   const bindings = getCurrentCharacterBindings();
   const item = bindings.presets.items.find(binding => binding.id === id);
   if (!item) return;
+  const referenceOnly = item.referenceOnly === true;
   Object.assign(item, snapshot, {
     id: item.id,
     name: item.name,
     createdAt: item.createdAt || snapshot.createdAt,
+    ...(referenceOnly ? { referenceOnly: true, promptOrder: [] } : {}),
     updatedAt: new Date().toISOString(),
   });
   if (await saveCurrentCharacterBindings(bindings)) {
@@ -3030,14 +3144,16 @@ async function updateWorldBookBinding(id) {
     ...characterSelection.additional,
   ]);
   const description = currentNames.length ? currentNames.join('、') : '无世界书';
-  if (!await requestUpdateBindingConfirmation('更新世界书绑定', `将“${item.name}”更新为当前启用及角色挂载的世界书（${description}）和全部条目，是否继续？`)) return;
+  if (!await requestUpdateBindingConfirmation('更新世界书绑定', `将“${item.name}”更新为当前启用及角色挂载的世界书（${description}），是否继续？`)) return;
 
   try {
-    const snapshot = await captureWorldBookBinding(item.name);
+    const snapshot = await captureWorldBookBinding(item.name, { includeData: false });
     Object.assign(item, snapshot, {
       id: item.id,
       name: item.name,
       createdAt: item.createdAt || snapshot.createdAt,
+      referenceOnly: true,
+      books: snapshot.books.map(book => ({ name: book.name })),
       updatedAt: new Date().toISOString(),
     });
     if (await saveCurrentCharacterBindings(bindings)) {
@@ -3045,7 +3161,7 @@ async function updateWorldBookBinding(id) {
     }
   } catch (error) {
     console.error('TavernAssetClassifier: failed to update world books', error);
-    notify('error', '读取世界书条目失败，未更新绑定。');
+    notify('error', '读取当前世界书失败，未更新绑定。');
   }
 }
 
@@ -3403,7 +3519,7 @@ function makeBindingListItem(type, item, starredId) {
   row.className = `tac-binding-item${type === 'users' ? ' tac-binding-user-item' : ''}${isStacked ? ' tac-binding-stacked-item' : ''}${isStarred ? ' is-starred' : ''}`;
   const worldBookNames = Array.isArray(item.books) ? item.books.map(book => book.name) : [];
   const typeLabel = type === 'presets' ? '预设' : type === 'worldBooks' ? '世界书' : 'user';
-  row.dataset.searchText = [item.name, item.presetName, item.presetValue, item.userName, ...worldBookNames, typeLabel]
+  row.dataset.searchText = [item.name, item.presetName, item.presetValue, getUserBindingDisplayName(item), item.avatar, ...worldBookNames, typeLabel]
     .filter(Boolean)
     .join(' ')
     .toLocaleLowerCase('zh-Hans-CN');
@@ -3434,7 +3550,7 @@ function makeBindingListItem(type, item, starredId) {
   } else if (type === 'worldBooks') {
     meta.textContent = `${getWorldBookBindingSummary(item)}${worldBookNames.length ? ` · ${worldBookNames.join('、')}` : ''}`;
   } else {
-    meta.textContent = item.userName || '未记录角色名';
+    meta.textContent = getUserBindingDisplayName(item);
   }
   main.append(title, meta);
 
@@ -5707,7 +5823,7 @@ function renderWorldBookBindingModule(bindings) {
   section.innerHTML = `
     <div class="tac-binding-module-head">
       <div class="tac-binding-module-title"><i class="fa-solid fa-book-atlas"></i> 世界书绑定</div>
-      <button type="button" class="menu_button tac-binding-save" title="保存当前启用及角色挂载的全部世界书和条目"><i class="fa-solid fa-floppy-disk"></i><span>保存</span></button>
+      <button type="button" class="menu_button tac-binding-save" title="保存当前启用及角色挂载的世界书引用"><i class="fa-solid fa-floppy-disk"></i><span>保存</span></button>
     </div>
     <div class="tac-binding-list"></div>
   `;
